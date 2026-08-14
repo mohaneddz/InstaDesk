@@ -168,7 +168,10 @@ export function installTitlebar(win: Window): void {
     if (!win.document.body || win.document.querySelector("#instadesk-titlebar-host")) return;
     const host = win.document.createElement("div");
     host.id = "instadesk-titlebar-host";
-    host.style.cssText = "position:fixed;inset:0 0 auto 0;height:38px;z-index:2147483647;display:block";
+    // `inset: 0` sizes a fixed element to the layout viewport, which excludes
+    // the browser's scrollbar gutter. Use the visual viewport width so the
+    // chrome background and controls layer over that gutter as well.
+    host.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:38px;z-index:2147483647;display:block";
     const root = host.attachShadow({ mode: "closed" });
     root.innerHTML = `
       <style>

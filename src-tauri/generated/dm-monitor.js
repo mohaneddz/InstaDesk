@@ -126,7 +126,7 @@
       if (!win.document.body || win.document.querySelector("#instadesk-titlebar-host")) return;
       const host = win.document.createElement("div");
       host.id = "instadesk-titlebar-host";
-      host.style.cssText = "position:fixed;inset:0 0 auto 0;height:38px;z-index:2147483647;display:block";
+      host.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:38px;z-index:2147483647;display:block";
       const root = host.attachShadow({ mode: "closed" });
       root.innerHTML = `
       <style>
