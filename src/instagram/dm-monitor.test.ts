@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { blockedDestination, classifyThread, installContentControls, installNavigationShortcuts, parseCurrentThread, threadIdFromPath } from "./dm-monitor";
+import { blockedDestination, classifyThread, installContentControls, installNavigationShortcuts, parseCurrentThread, postMediaSources, threadIdFromPath } from "./dm-monitor";
 
 const location = { pathname: "/direct/t/123/", href: "https://www.instagram.com/direct/t/123/" } as Location;
 function page(header: string, rows: string): Document {
@@ -43,7 +43,10 @@ describe("Instagram DM parser", () => {
 });
 
 describe("content controls", () => {
-  const controls = { disableHomeFeed: true, disableReels: true, disableExplore: true, disableSearch: true };
+  const controls = {
+    disableHomeFeed: true, disableReels: true, disableExplore: true, disableSearch: true,
+    disablePosts: true, disableStories: true, disableSuggestions: true
+  };
   it("blocks selected distraction routes", () => {
     expect(blockedDestination("/", controls)).toBe(true);
     expect(blockedDestination("/reels/abc/", controls)).toBe(true);
@@ -56,6 +59,10 @@ describe("content controls", () => {
     expect(blockedDestination("/accounts/login/", controls)).toBe(false);
   });
   it("installs navigation hiding rules from native startup state", async () => {
+    document.body.innerHTML = `<main>
+      <section id="feed"><div id="stories"><a href="/stories/a/"></a><a href="/stories/b/"></a></div><article></article></section>
+      <aside id="suggestions"><div>Suggested for you</div><span>See all</span><a href="/a/"></a><a href="/b/"></a><a href="/c/"></a></aside>
+    </main>`;
     window.__INSTADESK_CONTENT_CONTROLS__ = controls;
     window.__TAURI_INTERNALS__ = { invoke: async () => controls };
     installContentControls(window);
@@ -66,6 +73,10 @@ describe("content controls", () => {
     expect(rules).toContain('aria-label="Reels"');
     expect(rules).toContain('aria-label="Explore"');
     expect(rules).toContain('aria-label="Search"');
+    expect(rules).toContain("main article");
+    expect(document.querySelector<HTMLElement>("#stories")!.style.display).toBe("none");
+    expect(document.querySelector<HTMLElement>("#suggestions")!.style.display).toBe("none");
+    expect(document.querySelector<HTMLElement>("#feed")!.style.marginLeft).toBe("auto");
   });
 });
 
@@ -82,7 +93,18 @@ describe("navigation shortcuts", () => {
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "F11", cancelable: true }));
     await Promise.resolve();
 
-    expect(actions).toEqual(["back", "forward", "fullscreen"]);
-    expect(reachedPageHandler).toBe(false);
+    expect(actions).toEqual(["fullscreen"]);
+    expect(reachedPageHandler).toBe(true);
+  });
+});
+
+describe("post media actions", () => {
+  it("collects large post media while excluding the author avatar", () => {
+    document.body.innerHTML = `<article><header><img src="https://cdn.example/avatar.jpg" width="40"></header>
+      <img src="https://cdn.example/photo.jpg" width="640"><video src="https://cdn.example/video.mp4"></video></article>`;
+    expect(postMediaSources(document.querySelector("article")!)).toEqual([
+      { kind: "video", url: "https://cdn.example/video.mp4" },
+      { kind: "image", url: "https://cdn.example/photo.jpg" }
+    ]);
   });
 });
