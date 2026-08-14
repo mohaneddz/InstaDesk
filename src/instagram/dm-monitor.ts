@@ -130,7 +130,15 @@ export function parseCurrentThread(document: Document, location: Pick<Location, 
   });
 }
 
-declare global { interface Window { __INSTADESK_MONITOR__?: boolean; __INSTADESK_SHORTCUTS__?: boolean; __TAURI_INTERNALS__?: { invoke: (command: string, args?: unknown) => Promise<unknown> }; } }
+declare global {
+  interface Window {
+    __INSTADESK_MONITOR__?: boolean;
+    __INSTADESK_SHORTCUTS__?: boolean;
+    __INSTADESK_CONTROLS__?: boolean;
+    __INSTADESK_CONTENT_CONTROLS__?: Partial<ContentControls>;
+    __TAURI_INTERNALS__?: { invoke: (command: string, args?: unknown) => Promise<unknown> };
+  }
+}
 
 /**
  * Remote sites commonly block Tauri's ipc.localhost fetch with their CSP.
@@ -180,32 +188,42 @@ export function installNavigationShortcuts(win: Window): void {
 
 /** Applies optional distraction controls while leaving login/account pages alone. */
 export function installContentControls(win: Window): void {
+  if (win.__INSTADESK_CONTROLS__) return;
+  win.__INSTADESK_CONTROLS__ = true;
   const style = win.document.createElement("style");
   style.id = "instadesk-content-controls";
   (win.document.head ?? win.document.documentElement).append(style);
-  let controls = { ...DEFAULT_CONTROLS };
+  let controls = { ...DEFAULT_CONTROLS, ...win.__INSTADESK_CONTENT_CONTROLS__ };
   let redirecting = false;
 
   const loggedIn = () => Boolean(win.document.querySelector('a[href^="/direct/"]')) && !win.document.querySelector('input[name="password"]');
   const apply = () => {
     const rules: string[] = [];
-    if (controls.disableHomeFeed) rules.push('a[href="/"]');
-    if (controls.disableReels) rules.push('a[href^="/reels"]');
-    if (controls.disableExplore) rules.push('a[href^="/explore"]');
-    if (controls.disableSearch) rules.push('[role="button"]:has([aria-label="Search"]),a:has([aria-label="Search"])');
+    if (controls.disableHomeFeed) rules.push('a[href="/"]:has([aria-label="Home"]),a[href="https://www.instagram.com/"]:has([aria-label="Home"])');
+    if (controls.disableReels) rules.push('a[href*="/reels"]:has([aria-label="Reels"]),a:has([aria-label="Reels"])');
+    if (controls.disableExplore) rules.push('a[href*="/explore"]:has([aria-label="Explore"]),a:has([aria-label="Explore"])');
+    if (controls.disableSearch) rules.push('[role="button"]:has([aria-label="Search"]),[role="link"]:has([aria-label="Search"]),a:has([aria-label="Search"])');
     style.textContent = rules.length ? `${rules.join(",")} { display:none !important; }` : "";
-    if (!redirecting && blockedDestination(win.location.pathname, controls, loggedIn())) {
+    const pathname = win.location?.pathname;
+    if (!pathname) return;
+    if (!redirecting && blockedDestination(pathname, controls, loggedIn())) {
       redirecting = true;
-      console.debug("[InstaDesk] blocked page redirected to DMs", { pathname: win.location.pathname });
+      console.debug("[InstaDesk] blocked page redirected to DMs", { pathname });
       win.location.replace("/direct/inbox/");
     }
   };
   const refresh = async () => {
     try {
       controls = { ...DEFAULT_CONTROLS, ...await win.__TAURI_INTERNALS__?.invoke("get_content_controls") as Partial<ContentControls> };
+      win.__INSTADESK_CONTENT_CONTROLS__ = controls;
       redirecting = false;
       apply();
-    } catch (error) { console.warn("[InstaDesk] could not load content controls", error); }
+    } catch (error) {
+      // The native shell also injects the last saved state at document start,
+      // so controls remain functional if remote-page IPC is unavailable.
+      apply();
+      console.warn("[InstaDesk] could not refresh content controls", error);
+    }
   };
   win.document.addEventListener("click", (event) => {
     const target = event.target as Element | null;
@@ -220,9 +238,19 @@ export function installContentControls(win: Window): void {
       }
     } catch { /* Ignore malformed third-party links. */ }
   }, true);
-  new MutationObserver(apply).observe(win.document.documentElement, { childList: true, subtree: true });
+  // Watch Instagram's app tree, not <head>; apply() rewrites our stylesheet and
+  // observing that write would continuously trigger the observer itself.
+  new MutationObserver(apply).observe(win.document.body, { childList: true, subtree: true });
   win.addEventListener("popstate", apply);
-  win.addEventListener("instadesk:settings-changed", () => void refresh());
+  win.addEventListener("instadesk:settings-changed", (event) => {
+    const changed = (event as CustomEvent<Partial<ContentControls>>).detail;
+    if (!changed) { void refresh(); return; }
+    controls = { ...DEFAULT_CONTROLS, ...changed };
+    win.__INSTADESK_CONTENT_CONTROLS__ = controls;
+    redirecting = false;
+    apply();
+  });
+  apply();
   void refresh();
 }
 
@@ -272,6 +300,10 @@ export function installMonitor(win: Window): void {
 if (typeof window !== "undefined" && location.hostname.endsWith("instagram.com")) {
   installRemoteIpcFallback(window);
   installNavigationShortcuts(window);
-  installContentControls(window);
-  installMonitor(window);
+  const installPageFeatures = () => {
+    installContentControls(window);
+    installMonitor(window);
+  };
+  if (document.body) installPageFeatures();
+  else document.addEventListener("DOMContentLoaded", installPageFeatures, { once: true });
 }

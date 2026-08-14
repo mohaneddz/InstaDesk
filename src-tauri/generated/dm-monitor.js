@@ -29,8 +29,8 @@
     if (controls.disableExplore && /^\/explore(?:\/|$)/.test(pathname)) return true;
     return false;
   }
-  function classifyThread(document) {
-    const main = document.querySelector("main") ?? document.body;
+  function classifyThread(document2) {
+    const main = document2.querySelector("main") ?? document2.body;
     const header = main.querySelector("header") ?? main.querySelector('[role="banner"]');
     if (!header) return { kind: "unknown" };
     const semantic = [header.getAttribute("aria-label"), normalizedText(header)].filter(Boolean).join(" ");
@@ -52,8 +52,8 @@
     if (peers.size !== 1) return { kind: peers.size > 1 ? "group" : "unknown" };
     return { kind: "private", peer: [...peers.values()][0] };
   }
-  function messageRows(document) {
-    const main = document.querySelector("main") ?? document.body;
+  function messageRows(document2) {
+    const main = document2.querySelector("main") ?? document2.body;
     const selectors = [
       "[data-message-id]",
       '[role="row"][aria-label]',
@@ -76,12 +76,12 @@
     const text = labelled || normalizedText(row);
     return text.slice(0, 240);
   }
-  function parseCurrentThread(document, location2, now = Date.now()) {
+  function parseCurrentThread(document2, location2, now = Date.now()) {
     const conversationId = threadIdFromPath(location2.pathname);
     if (!conversationId) return [];
-    const classification = classifyThread(document);
+    const classification = classifyThread(document2);
     if (classification.kind !== "private") return [];
-    return messageRows(document).flatMap((row) => {
+    return messageRows(document2).flatMap((row) => {
       if (!isIncoming(row, classification.peer)) return [];
       const preview = previewFor(row);
       if (!preview) return [];
@@ -136,32 +136,38 @@
     }, true);
   }
   function installContentControls(win) {
+    if (win.__INSTADESK_CONTROLS__) return;
+    win.__INSTADESK_CONTROLS__ = true;
     const style = win.document.createElement("style");
     style.id = "instadesk-content-controls";
     (win.document.head ?? win.document.documentElement).append(style);
-    let controls = { ...DEFAULT_CONTROLS };
+    let controls = { ...DEFAULT_CONTROLS, ...win.__INSTADESK_CONTENT_CONTROLS__ };
     let redirecting = false;
     const loggedIn = () => Boolean(win.document.querySelector('a[href^="/direct/"]')) && !win.document.querySelector('input[name="password"]');
     const apply = () => {
       const rules = [];
-      if (controls.disableHomeFeed) rules.push('a[href="/"]');
-      if (controls.disableReels) rules.push('a[href^="/reels"]');
-      if (controls.disableExplore) rules.push('a[href^="/explore"]');
-      if (controls.disableSearch) rules.push('[role="button"]:has([aria-label="Search"]),a:has([aria-label="Search"])');
+      if (controls.disableHomeFeed) rules.push('a[href="/"]:has([aria-label="Home"]),a[href="https://www.instagram.com/"]:has([aria-label="Home"])');
+      if (controls.disableReels) rules.push('a[href*="/reels"]:has([aria-label="Reels"]),a:has([aria-label="Reels"])');
+      if (controls.disableExplore) rules.push('a[href*="/explore"]:has([aria-label="Explore"]),a:has([aria-label="Explore"])');
+      if (controls.disableSearch) rules.push('[role="button"]:has([aria-label="Search"]),[role="link"]:has([aria-label="Search"]),a:has([aria-label="Search"])');
       style.textContent = rules.length ? `${rules.join(",")} { display:none !important; }` : "";
-      if (!redirecting && blockedDestination(win.location.pathname, controls, loggedIn())) {
+      const pathname = win.location?.pathname;
+      if (!pathname) return;
+      if (!redirecting && blockedDestination(pathname, controls, loggedIn())) {
         redirecting = true;
-        console.debug("[InstaDesk] blocked page redirected to DMs", { pathname: win.location.pathname });
+        console.debug("[InstaDesk] blocked page redirected to DMs", { pathname });
         win.location.replace("/direct/inbox/");
       }
     };
     const refresh = async () => {
       try {
         controls = { ...DEFAULT_CONTROLS, ...await win.__TAURI_INTERNALS__?.invoke("get_content_controls") };
+        win.__INSTADESK_CONTENT_CONTROLS__ = controls;
         redirecting = false;
         apply();
       } catch (error) {
-        console.warn("[InstaDesk] could not load content controls", error);
+        apply();
+        console.warn("[InstaDesk] could not refresh content controls", error);
       }
     };
     win.document.addEventListener("click", (event) => {
@@ -183,9 +189,20 @@
       } catch {
       }
     }, true);
-    new MutationObserver(apply).observe(win.document.documentElement, { childList: true, subtree: true });
+    new MutationObserver(apply).observe(win.document.body, { childList: true, subtree: true });
     win.addEventListener("popstate", apply);
-    win.addEventListener("instadesk:settings-changed", () => void refresh());
+    win.addEventListener("instadesk:settings-changed", (event) => {
+      const changed = event.detail;
+      if (!changed) {
+        void refresh();
+        return;
+      }
+      controls = { ...DEFAULT_CONTROLS, ...changed };
+      win.__INSTADESK_CONTENT_CONTROLS__ = controls;
+      redirecting = false;
+      apply();
+    });
+    apply();
     void refresh();
   }
   function installMonitor(win) {
@@ -236,7 +253,11 @@
   if (typeof window !== "undefined" && location.hostname.endsWith("instagram.com")) {
     installRemoteIpcFallback(window);
     installNavigationShortcuts(window);
-    installContentControls(window);
-    installMonitor(window);
+    const installPageFeatures = () => {
+      installContentControls(window);
+      installMonitor(window);
+    };
+    if (document.body) installPageFeatures();
+    else document.addEventListener("DOMContentLoaded", installPageFeatures, { once: true });
   }
 })();

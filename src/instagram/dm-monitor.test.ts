@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { blockedDestination, classifyThread, installNavigationShortcuts, parseCurrentThread, threadIdFromPath } from "./dm-monitor";
+import { blockedDestination, classifyThread, installContentControls, installNavigationShortcuts, parseCurrentThread, threadIdFromPath } from "./dm-monitor";
 
 const location = { pathname: "/direct/t/123/", href: "https://www.instagram.com/direct/t/123/" } as Location;
 function page(header: string, rows: string): Document {
@@ -54,6 +54,18 @@ describe("content controls", () => {
     expect(blockedDestination("/", controls, false)).toBe(false);
     expect(blockedDestination("/direct/inbox/", controls)).toBe(false);
     expect(blockedDestination("/accounts/login/", controls)).toBe(false);
+  });
+  it("installs navigation hiding rules from native startup state", async () => {
+    window.__INSTADESK_CONTENT_CONTROLS__ = controls;
+    window.__TAURI_INTERNALS__ = { invoke: async () => controls };
+    installContentControls(window);
+    await Promise.resolve();
+
+    const rules = document.querySelector<HTMLStyleElement>("#instadesk-content-controls")!.textContent;
+    expect(rules).toContain('aria-label="Home"');
+    expect(rules).toContain('aria-label="Reels"');
+    expect(rules).toContain('aria-label="Explore"');
+    expect(rules).toContain('aria-label="Search"');
   });
 });
 
