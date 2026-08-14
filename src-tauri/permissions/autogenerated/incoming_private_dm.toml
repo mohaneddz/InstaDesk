@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-incoming-private-dm"
+description = "Enables the incoming_private_dm command without any pre-configured scope."
+commands.allow = ["incoming_private_dm"]
+
+[[permission]]
+identifier = "deny-incoming-private-dm"
+description = "Denies the incoming_private_dm command without any pre-configured scope."
+commands.deny = ["incoming_private_dm"]
