@@ -1,0 +1,29 @@
+{
+  "name": "instadesk",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "web:dev": "vite",
+    "build": "tsc && vite build && npm run build:monitor",
+    "build:monitor": "esbuild src/instagram/dm-monitor.ts --bundle --format=iife --platform=browser --target=es2020 --outfile=src-tauri/generated/dm-monitor.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build --bundles nsis,msi"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
+    "jsdom": "^26.0.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0",
+    "vitest": "^3.2.0"
+  }
+}
