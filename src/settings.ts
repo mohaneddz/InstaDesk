@@ -40,7 +40,7 @@ app.innerHTML = `
         <div class="shortcut-row"><span>Back</span><span class="keys"><kbd>Alt</kbd><em>+</em><kbd>←</kbd></span></div>
         <div class="shortcut-row"><span>Forward</span><span class="keys"><kbd>Alt</kbd><em>+</em><kbd>→</kbd></span></div>
       </div>
-      <p class="global-note">Global shortcuts: <strong>Alt + Left</strong> and <strong>Ctrl + Right</strong></p>
+      <p class="global-note">Available while Instagram is focused.</p>
     </section>
     <footer><span class="status-dot" aria-hidden="true"></span><p id="status" role="status">Settings save automatically</p></footer>
   </section>`;
