@@ -139,6 +139,16 @@ fn layout_main_window<R: Runtime>(window: &Window<R>) {
 
 fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>> {
     let url = url::Url::parse(INSTAGRAM_HOME).expect("valid Instagram URL");
+    let initial_settings = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .map(|settings| serde_json::to_string(&*settings).unwrap_or_else(|_| "{}".into()))
+        .unwrap_or_else(|_| "{}".into());
+    let initialization_script = format!(
+        "window.__INSTADESK_CONTENT_CONTROLS__ = {initial_settings};\n{}",
+        include_str!("../generated/dm-monitor.js")
+    );
     let window = WindowBuilder::new(app, "main")
         .title("")
         .inner_size(1160.0, 800.0)
@@ -155,7 +165,7 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
     )?;
     window.add_child(
         WebviewBuilder::new("instagram", WebviewUrl::External(url))
-            .initialization_script(include_str!("../generated/dm-monitor.js"))
+            .initialization_script(initialization_script)
             .on_navigation(|url| instagram_url(url.as_str()).is_some()),
         PhysicalPosition::new(0, chrome_height as i32),
         PhysicalSize::new(size.width, size.height.saturating_sub(chrome_height)),
@@ -363,8 +373,10 @@ fn update_settings(
     let _ = app.remove_tray_by_id("instadesk-tray");
     build_tray(&app, &settings).map_err(|error| error.to_string())?;
     if let Some(instagram) = app.get_webview("instagram") {
-        let _ =
-            instagram.eval("window.dispatchEvent(new CustomEvent('instadesk:settings-changed'))");
+        let settings_json = serde_json::to_string(&settings).map_err(|error| error.to_string())?;
+        let _ = instagram.eval(format!(
+            "window.dispatchEvent(new CustomEvent('instadesk:settings-changed', {{ detail: {settings_json} }}))"
+        ));
     }
     Ok(settings)
 }
