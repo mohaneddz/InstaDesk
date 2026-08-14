@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { blockedDestination, classifyThread, parseCurrentThread, threadIdFromPath } from "./dm-monitor";
+import { blockedDestination, classifyThread, installNavigationShortcuts, parseCurrentThread, threadIdFromPath } from "./dm-monitor";
 
 const location = { pathname: "/direct/t/123/", href: "https://www.instagram.com/direct/t/123/" } as Location;
 function page(header: string, rows: string): Document {
@@ -54,5 +54,23 @@ describe("content controls", () => {
     expect(blockedDestination("/", controls, false)).toBe(false);
     expect(blockedDestination("/direct/inbox/", controls)).toBe(false);
     expect(blockedDestination("/accounts/login/", controls)).toBe(false);
+  });
+});
+
+describe("navigation shortcuts", () => {
+  it("captures app shortcuts before page handlers", async () => {
+    const actions: string[] = [];
+    window.__TAURI_INTERNALS__ = { invoke: async (_command, args) => { actions.push((args as { action: string }).action); } };
+    installNavigationShortcuts(window);
+    let reachedPageHandler = false;
+    window.addEventListener("keydown", () => { reachedPageHandler = true; });
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", altKey: true, cancelable: true }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", altKey: true, cancelable: true }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "F11", cancelable: true }));
+    await Promise.resolve();
+
+    expect(actions).toEqual(["back", "forward", "fullscreen"]);
+    expect(reachedPageHandler).toBe(false);
   });
 });

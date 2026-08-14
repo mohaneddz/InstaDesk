@@ -130,7 +130,7 @@ export function parseCurrentThread(document: Document, location: Pick<Location, 
   });
 }
 
-declare global { interface Window { __INSTADESK_MONITOR__?: boolean; __INSTADESK_CHROME__?: boolean; __TAURI_INTERNALS__?: { invoke: (command: string, args?: unknown) => Promise<unknown> }; } }
+declare global { interface Window { __INSTADESK_MONITOR__?: boolean; __INSTADESK_SHORTCUTS__?: boolean; __TAURI_INTERNALS__?: { invoke: (command: string, args?: unknown) => Promise<unknown> }; } }
 
 /**
  * Remote sites commonly block Tauri's ipc.localhost fetch with their CSP.
@@ -160,50 +160,21 @@ function nativeAction(win: Window, action: string): void {
   void win.__TAURI_INTERNALS__?.invoke("window_action", { action }).catch((error) => console.warn("[InstaDesk] window action failed", error));
 }
 
-/** Adds Windows-style chrome without coupling selectors to Instagram's DOM. */
-export function installTitlebar(win: Window): void {
-  if (win.__INSTADESK_CHROME__) return;
-  win.__INSTADESK_CHROME__ = true;
-  const mount = () => {
-    if (!win.document.body || win.document.querySelector("#instadesk-titlebar-host")) return;
-    const host = win.document.createElement("div");
-    host.id = "instadesk-titlebar-host";
-    // `inset: 0` sizes a fixed element to the layout viewport, which excludes
-    // the browser's scrollbar gutter. Use the visual viewport width so the
-    // chrome background and controls layer over that gutter as well.
-    host.style.cssText = "position:fixed;top:0;left:0;width:100vw;height:38px;z-index:2147483647;display:block";
-    const root = host.attachShadow({ mode: "closed" });
-    root.innerHTML = `
-      <style>
-        *{box-sizing:border-box} .bar{height:38px;display:flex;align-items:center;background:#111115f7;color:#e8e8eb;border-bottom:1px solid #ffffff17;box-shadow:0 1px 5px #0004;font:12px/1 "Segoe UI Variable","Segoe UI",sans-serif;user-select:none}
-        .drag{height:100%;display:flex;align-items:center;gap:9px;flex:1;padding:0 10px}.logo{display:grid;place-items:center;width:21px;height:21px;border-radius:6px;background:linear-gradient(135deg,#8045db,#df3f70,#f7a63b);color:white;font-size:8px;font-weight:800}.name{font-weight:500}.unofficial{color:#74747e;font-size:10px;margin-left:2px}
-        .controls{height:100%;display:flex}.btn{width:46px;height:38px;display:grid;place-items:center;border:0;background:transparent;color:#d6d6da;padding:0}.btn:hover{background:#ffffff13}.btn:active{background:#ffffff20}.btn.close:hover{background:#c42b1c;color:#fff}.btn svg{width:13px;height:13px;stroke:currentColor;stroke-width:1.35;fill:none}.btn.settings svg{width:15px;height:15px}.btn:focus-visible{outline:2px solid #b74cca;outline-offset:-2px}
-      </style>
-      <div class="bar">
-        <div class="drag" aria-label="InstaDesk title bar"><span class="logo">ID</span><span class="name">Instagram</span><span class="unofficial">via InstaDesk</span></div>
-        <div class="controls">
-          <button class="btn settings" data-action="settings" title="Settings" aria-label="Settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg></button>
-          <button class="btn" data-action="minimize" title="Minimize" aria-label="Minimize"><svg viewBox="0 0 12 12"><path d="M1 9.5h10"/></svg></button>
-          <button class="btn" data-action="maximize" title="Maximize" aria-label="Maximize"><svg viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9"/></svg></button>
-          <button class="btn" data-action="fullscreen" title="Fullscreen (F11)" aria-label="Toggle fullscreen"><svg viewBox="0 0 12 12"><path d="M1 4V1h3M8 1h3v3M11 8v3H8M4 11H1V8"/></svg></button>
-          <button class="btn close" data-action="close" title="Close to tray" aria-label="Close to tray"><svg viewBox="0 0 12 12"><path d="m1.5 1.5 9 9m0-9-9 9"/></svg></button>
-        </div>
-      </div>`;
-    const drag = root.querySelector<HTMLElement>(".drag")!;
-    drag.addEventListener("pointerdown", () => nativeAction(win, "drag"));
-    drag.addEventListener("dblclick", () => nativeAction(win, "maximize"));
-    root.querySelectorAll<HTMLButtonElement>("button[data-action]").forEach((button) => button.addEventListener("click", () => nativeAction(win, button.dataset.action!)));
-    win.document.documentElement.append(host);
-    win.document.body.style.setProperty("padding-top", "38px", "important");
-    win.document.body.style.setProperty("box-sizing", "border-box", "important");
-    console.debug("[InstaDesk] custom titlebar installed");
-  };
-  if (win.document.readyState === "loading") win.document.addEventListener("DOMContentLoaded", mount, { once: true }); else mount();
+/** Captures app navigation shortcuts before Instagram handles the key event. */
+export function installNavigationShortcuts(win: Window): void {
+  if (win.__INSTADESK_SHORTCUTS__) return;
+  win.__INSTADESK_SHORTCUTS__ = true;
   win.addEventListener("keydown", (event) => {
-    if (event.key === "F11") { event.preventDefault(); nativeAction(win, "fullscreen"); return; }
-    if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
-    if (event.key === "ArrowLeft") { event.preventDefault(); nativeAction(win, "back"); }
-    if (event.key === "ArrowRight") { event.preventDefault(); nativeAction(win, "forward"); }
+    let action: string | undefined;
+    if (event.key === "F11") action = "fullscreen";
+    if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
+      if (event.key === "ArrowLeft") action = "back";
+      if (event.key === "ArrowRight") action = "forward";
+    }
+    if (!action) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    nativeAction(win, action);
   }, true);
 }
 
@@ -300,7 +271,7 @@ export function installMonitor(win: Window): void {
 
 if (typeof window !== "undefined" && location.hostname.endsWith("instagram.com")) {
   installRemoteIpcFallback(window);
-  installTitlebar(window);
+  installNavigationShortcuts(window);
   installContentControls(window);
   installMonitor(window);
 }
