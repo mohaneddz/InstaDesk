@@ -10,6 +10,9 @@ interface Settings {
   disableReels: boolean;
   disableExplore: boolean;
   disableSearch: boolean;
+  disablePosts: boolean;
+  disableStories: boolean;
+  disableSuggestions: boolean;
 }
 
 const app = document.querySelector<HTMLElement>("#app")!;
@@ -33,14 +36,16 @@ app.innerHTML = `
       <label><span><b>Disable Reels</b><small>Hide and block Reels pages.</small></span><input id="disableReels" type="checkbox"><i></i></label>
       <label><span><b>Disable Explore</b><small>Hide and block Explore pages.</small></span><input id="disableExplore" type="checkbox"><i></i></label>
       <label><span><b>Disable Search</b><small>Hide Instagram’s search entry.</small></span><input id="disableSearch" type="checkbox"><i></i></label>
+      <label><span><b>Disable Posts</b><small>Hide posts from the Home feed.</small></span><input id="disablePosts" type="checkbox"><i></i></label>
+      <label><span><b>Disable Stories</b><small>Hide the stories row from Home.</small></span><input id="disableStories" type="checkbox"><i></i></label>
+      <label><span><b>Disable Suggestions</b><small>Hide suggested accounts and center the feed.</small></span><input id="disableSuggestions" type="checkbox"><i></i></label>
     </div>
     <section class="shortcuts" aria-labelledby="shortcuts-title">
       <div class="shortcuts-copy"><b id="shortcuts-title">Navigation shortcuts</b><small>Move through your Instagram history.</small></div>
       <div class="shortcut-list">
-        <div class="shortcut-row"><span>Back</span><span class="keys"><kbd>Alt</kbd><em>+</em><kbd>←</kbd></span></div>
-        <div class="shortcut-row"><span>Forward</span><span class="keys"><kbd>Alt</kbd><em>+</em><kbd>→</kbd></span></div>
+        <div class="shortcut-row"><span>Toggle app</span><span class="keys"><kbd>Left Alt</kbd><em>+</em><kbd>Right Alt</kbd></span></div>
       </div>
-      <p class="global-note">Available while Instagram is focused.</p>
+      <p class="global-note">Available globally, including while InstaDesk is hidden.</p>
     </section>
     <footer><span class="status-dot" aria-hidden="true"></span><p id="status" role="status">Settings save automatically</p></footer>
   </section>`;
@@ -48,7 +53,8 @@ app.innerHTML = `
 const status = document.querySelector<HTMLElement>("#status")!;
 const keys: (keyof Settings)[] = [
   "notifications", "notificationPreviews", "minimizeToTray", "launchAtStartup",
-  "disableHomeFeed", "disableReels", "disableExplore", "disableSearch"
+  "disableHomeFeed", "disableReels", "disableExplore", "disableSearch",
+  "disablePosts", "disableStories", "disableSuggestions"
 ];
 let current: Settings;
 void invoke("settings_ui_ready");

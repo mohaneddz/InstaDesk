@@ -23,4 +23,4 @@ url = "2"
 
 [target.'cfg(windows)'.dependencies]
 notify-rust = "4.18"
-windows = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

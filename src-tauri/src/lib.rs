@@ -1,4 +1,9 @@
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, OnceLock,
+};
 use std::{
     collections::{HashSet, VecDeque},
     fs,
@@ -21,6 +26,15 @@ const SETTINGS_FILE: &str = "settings.json";
 const MAX_DEDUP: usize = 1000;
 const TITLEBAR_HEIGHT: f64 = 38.0;
 
+#[cfg(windows)]
+static ALT_TOGGLE_SENDER: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+#[cfg(windows)]
+static LEFT_ALT_DOWN: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+static RIGHT_ALT_DOWN: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+static ALT_TOGGLE_FIRED: AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Settings {
@@ -32,6 +46,9 @@ struct Settings {
     disable_reels: bool,
     disable_explore: bool,
     disable_search: bool,
+    disable_posts: bool,
+    disable_stories: bool,
+    disable_suggestions: bool,
 }
 
 impl Default for Settings {
@@ -45,6 +62,9 @@ impl Default for Settings {
             disable_reels: false,
             disable_explore: false,
             disable_search: false,
+            disable_posts: false,
+            disable_stories: false,
+            disable_suggestions: false,
         }
     }
 }
@@ -113,6 +133,106 @@ fn show_instagram<R: Runtime>(app: &AppHandle<R>, destination: Option<&str>) {
     let _ = window.show();
     let _ = window.unminimize();
     let _ = window.set_focus();
+}
+
+fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
+    let Some(window) = app.get_window("main") else {
+        return;
+    };
+    let visible = window.is_visible().unwrap_or(false);
+    let minimized = window.is_minimized().unwrap_or(false);
+    if visible && !minimized {
+        if let Some(settings) = app.get_webview_window("settings") {
+            let _ = settings.hide();
+        }
+        let minimize_to_tray = app
+            .state::<AppState>()
+            .settings
+            .lock()
+            .map(|settings| settings.minimize_to_tray)
+            .unwrap_or(true);
+        if minimize_to_tray {
+            let _ = window.hide();
+        } else {
+            let _ = window.minimize();
+        }
+    } else {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn alt_toggle_hook(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::{
+        Input::KeyboardAndMouse::{VK_LMENU, VK_RMENU},
+        WindowsAndMessaging::{
+            CallNextHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+            WM_SYSKEYUP,
+        },
+    };
+
+    if code >= 0 {
+        let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        if !event.flags.contains(LLKHF_INJECTED) {
+            let pressed = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+            let released = matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP);
+            let is_left_alt = event.vkCode == VK_LMENU.0 as u32;
+            let is_right_alt = event.vkCode == VK_RMENU.0 as u32;
+            if is_left_alt && (pressed || released) {
+                LEFT_ALT_DOWN.store(pressed, Ordering::SeqCst);
+            }
+            if is_right_alt && (pressed || released) {
+                RIGHT_ALT_DOWN.store(pressed, Ordering::SeqCst);
+            }
+            if released && (is_left_alt || is_right_alt) {
+                ALT_TOGGLE_FIRED.store(false, Ordering::SeqCst);
+            } else if LEFT_ALT_DOWN.load(Ordering::SeqCst)
+                && RIGHT_ALT_DOWN.load(Ordering::SeqCst)
+                && !ALT_TOGGLE_FIRED.swap(true, Ordering::SeqCst)
+            {
+                if let Some(sender) = ALT_TOGGLE_SENDER.get() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+#[cfg(windows)]
+fn install_alt_toggle<R: Runtime>(app: &AppHandle<R>) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetMessageW, SetWindowsHookExW, MSG, WH_KEYBOARD_LL,
+    };
+
+    let (sender, receiver) = mpsc::channel();
+    if ALT_TOGGLE_SENDER.set(sender).is_err() {
+        return;
+    }
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        while receiver.recv().is_ok() {
+            toggle_main_window(&handle);
+        }
+    });
+    std::thread::spawn(move || unsafe {
+        let hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(alt_toggle_hook), None, 0) {
+            Ok(hook) => hook,
+            Err(error) => {
+                eprintln!("[InstaDesk] could not install Left Alt + Right Alt shortcut: {error}");
+                return;
+            }
+        };
+        let mut message = MSG::default();
+        while GetMessageW(&mut message, None, 0, 0).as_bool() {}
+        let _ = windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(hook);
+    });
 }
 
 fn layout_main_window<R: Runtime>(window: &Window<R>) {
@@ -619,6 +739,8 @@ pub fn run() {
             build_tray(app.handle(), &settings)?;
             create_settings_window(app.handle())?;
             let window = create_main_window(app.handle())?;
+            #[cfg(windows)]
+            install_alt_toggle(app.handle());
             if std::env::args().any(|arg| arg == "--hidden") { let _ = window.hide(); }
             if std::env::args().any(|arg| arg == "--open-settings") { show_settings(app.handle()); }
             #[cfg(debug_assertions)]
