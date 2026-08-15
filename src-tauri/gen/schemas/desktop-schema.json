@@ -177,6 +177,18 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the copy_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-copy-image",
+          "markdownDescription": "Enables the copy_image command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the download_media command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-download-media",
+          "markdownDescription": "Enables the download_media command without any pre-configured scope."
+        },
+        {
           "description": "Enables the get_content_controls command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-content-controls",
@@ -211,6 +223,18 @@
           "type": "string",
           "const": "allow-window-action",
           "markdownDescription": "Enables the window_action command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the copy_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-copy-image",
+          "markdownDescription": "Denies the copy_image command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the download_media command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-download-media",
+          "markdownDescription": "Denies the download_media command without any pre-configured scope."
         },
         {
           "description": "Denies the get_content_controls command without any pre-configured scope.",
