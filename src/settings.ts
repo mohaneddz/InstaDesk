@@ -2,7 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import "./settings.css";
 
 interface Settings {
-  notifications: boolean;
+  notifyPrivate: boolean;
+  notifyGroup: boolean;
   launchAtStartup: boolean;
   minimizeToTray: boolean;
   notificationPreviews: boolean;
@@ -14,6 +15,8 @@ interface Settings {
   disableStories: boolean;
   disableSuggestions: boolean;
   ghostStories: boolean;
+  hidePrivateChats: boolean;
+  hideGroupChats: boolean;
 }
 
 const app = document.querySelector<HTMLElement>("#app")!;
@@ -26,7 +29,8 @@ app.innerHTML = `
     <h1>InstaDesk settings</h1>
     <p class="lead">Choose how Instagram behaves on your desktop.</p>
     <div class="settings-list">
-      <label><span><b>Native notifications</b><small>Show Windows notifications for verified private DMs.</small></span><input id="notifications" type="checkbox"><i></i></label>
+      <label><span><b>Private message notifications</b><small>Show a Windows notification for new 1:1 direct messages.</small></span><input id="notifyPrivate" type="checkbox"><i></i></label>
+      <label><span><b>Group message notifications</b><small>Show a Windows notification for new group chat messages.</small></span><input id="notifyGroup" type="checkbox"><i></i></label>
       <label><span><b>Notification previews</b><small>Include message text in notifications.</small></span><input id="notificationPreviews" type="checkbox"><i></i></label>
       <label><span><b>Minimize to tray</b><small>Keep Instagram running when its window is closed.</small></span><input id="minimizeToTray" type="checkbox"><i></i></label>
       <label><span><b>Launch on startup</b><small>Start InstaDesk quietly with Windows.</small></span><input id="launchAtStartup" type="checkbox"><i></i></label>
@@ -45,21 +49,28 @@ app.innerHTML = `
     <div class="settings-list">
       <label><span><b>Ghost story viewer</b><small>View stories without sending a seen receipt.</small></span><input id="ghostStories" type="checkbox"><i></i></label>
     </div>
+    <div class="section-heading"><span><b>Chat visibility</b><small>Hide entire categories of chats from the Instagram inbox.</small></span></div>
+    <div class="settings-list">
+      <label><span><b>Hide private chats</b><small>Hide 1:1 conversations from the inbox list and block opening them.</small></span><input id="hidePrivateChats" type="checkbox"><i></i></label>
+      <label><span><b>Hide group chats</b><small>Hide group conversations from the inbox list and block opening them.</small></span><input id="hideGroupChats" type="checkbox"><i></i></label>
+    </div>
     <section class="shortcuts" aria-labelledby="shortcuts-title">
       <div class="shortcuts-copy"><b id="shortcuts-title">Navigation shortcuts</b><small>Move through your Instagram history.</small></div>
       <div class="shortcut-list">
         <div class="shortcut-row"><span>Toggle app</span><span class="keys"><kbd>Left Alt</kbd><em>+</em><kbd>Right Alt</kbd></span></div>
+        <div class="shortcut-row"><span>Back / forward, then hide</span><span class="keys"><kbd>Alt</kbd><em>+</em><kbd>←</kbd><em>/</em><kbd>→</kbd></span></div>
       </div>
-      <p class="global-note">Available globally, including while InstaDesk is hidden.</p>
+      <p class="global-note">Toggle app is available globally, including while InstaDesk is hidden.</p>
     </section>
     <footer><span class="status-dot" aria-hidden="true"></span><p id="status" role="status">Settings save automatically</p></footer>
   </section>`;
 
 const status = document.querySelector<HTMLElement>("#status")!;
 const keys: (keyof Settings)[] = [
-  "notifications", "notificationPreviews", "minimizeToTray", "launchAtStartup",
+  "notifyPrivate", "notifyGroup", "notificationPreviews", "minimizeToTray", "launchAtStartup",
   "disableHomeFeed", "disableReels", "disableExplore", "disableSearch",
-  "disablePosts", "disableStories", "disableSuggestions", "ghostStories"
+  "disablePosts", "disableStories", "disableSuggestions", "ghostStories",
+  "hidePrivateChats", "hideGroupChats"
 ];
 let current: Settings;
 void invoke("settings_ui_ready");
