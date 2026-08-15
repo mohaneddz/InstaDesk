@@ -88,7 +88,8 @@
     disableSearch: false,
     disablePosts: false,
     disableStories: false,
-    disableSuggestions: false
+    disableSuggestions: false,
+    ghostStories: false
   };
   var THREAD_RE = /^\/direct\/t\/([^/?#]+)\/?/;
   var GROUP_WORDS = /\b(group|members?|participants?|people)\b/i;
@@ -363,12 +364,15 @@
   function downloadableMedia(article) {
     return postMediaSources(article).filter((item) => /^https?:/i.test(item.url));
   }
+  async function invokeDownload(items, base, onProgress) {
+    const onProgressChannel = new Channel();
+    onProgressChannel.onmessage = (message) => onProgress(message.overallPercent);
+    return await invoke("download_media", { items, base, onProgress: onProgressChannel });
+  }
   async function downloadPostMedia(article, onProgress) {
     const media = downloadableMedia(article);
     if (!media.length) throw new Error("No downloadable media found in this post");
-    const onProgressChannel = new Channel();
-    onProgressChannel.onmessage = (message) => onProgress(message.overallPercent);
-    return await invoke("download_media", { items: media, base: safePostName(article), onProgress: onProgressChannel });
+    return invokeDownload(media, safePostName(article), onProgress);
   }
   async function copyPostImage(article) {
     const image = downloadableMedia(article).find((item) => item.kind === "image");
@@ -438,6 +442,198 @@
     new MutationObserver(enhance).observe(win.document.body, { childList: true, subtree: true });
     enhance();
   }
+  var STORY_SEEN_URL_PATTERN = /stor(y|ies)[_-]?(seen|viewed)|reel[_-]?(media[_-]?)?seen|seen[_-]?stor(y|ies)|media\/seen/i;
+  var STORY_SEEN_BODY_PATTERN = /reel[_-]?seen|stor(y|ies)[_-]?seen|seenState|PolarisStoriesV3ReelSeenMutation/i;
+  function looksLikeStorySeenRequest(url, body) {
+    if (STORY_SEEN_URL_PATTERN.test(url)) return true;
+    return Boolean(body && url.includes("/graphql/") && STORY_SEEN_BODY_PATTERN.test(body));
+  }
+  function installGhostStories(win) {
+    if (win.__INSTADESK_GHOST__) return;
+    win.__INSTADESK_GHOST__ = true;
+    const enabled = () => Boolean(win.__INSTADESK_CONTENT_CONTROLS__?.ghostStories);
+    const nativeFetch = win.fetch.bind(win);
+    win.fetch = (async (input, init) => {
+      try {
+        const raw = typeof input === "string" || input instanceof URL ? input.toString() : input.url;
+        const body = typeof init?.body === "string" ? init.body : void 0;
+        if (enabled() && looksLikeStorySeenRequest(raw, body)) {
+          console.debug("[InstaDesk] ghost mode suppressed a story view receipt");
+          return new Response(null, { status: 204 });
+        }
+      } catch {
+      }
+      return nativeFetch(input, init);
+    });
+    const XHR = win.XMLHttpRequest.prototype;
+    const nativeOpen = XHR.open;
+    const nativeSend = XHR.send;
+    XHR.open = function(method, url, ...rest) {
+      this.__instadeskUrl = String(url);
+      return nativeOpen.apply(this, [method, url, ...rest]);
+    };
+    XHR.send = function(body) {
+      const url = this.__instadeskUrl;
+      const bodyText = typeof body === "string" ? body : void 0;
+      if (enabled() && url && looksLikeStorySeenRequest(url, bodyText)) {
+        console.debug("[InstaDesk] ghost mode suppressed a story view receipt (xhr)");
+        win.setTimeout(() => {
+          Object.defineProperty(this, "readyState", { value: 4, configurable: true });
+          Object.defineProperty(this, "status", { value: 204, configurable: true });
+          this.dispatchEvent(new Event("readystatechange"));
+          this.dispatchEvent(new Event("load"));
+          this.dispatchEvent(new Event("loadend"));
+        }, 0);
+        return;
+      }
+      return nativeSend.call(this, body);
+    };
+  }
+  function sleep(win, ms) {
+    return new Promise((resolve) => win.setTimeout(resolve, ms));
+  }
+  function storyDialog(win) {
+    return win.document.querySelector('div[role="dialog"]');
+  }
+  function storySegmentCount(dialog) {
+    return dialog.querySelectorAll('[role="progressbar"]').length;
+  }
+  function storyControlButton(dialog, label) {
+    for (const button of dialog.querySelectorAll('button,[role="button"]')) {
+      if (label.test(button.getAttribute("aria-label") ?? "")) return button;
+    }
+    return null;
+  }
+  function isVisible(win, element) {
+    const rect = element.getBoundingClientRect();
+    if (rect.width < 50 || rect.height < 50) return false;
+    if (element.closest('[aria-hidden="true"]')) return false;
+    const style = win.getComputedStyle(element);
+    return style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity || "1") > 0.05;
+  }
+  function activeStoryMedia(win, dialog) {
+    const video = [...dialog.querySelectorAll("video")].find((el) => isVisible(win, el));
+    if (video) {
+      const url2 = video.currentSrc || video.src;
+      return url2 ? { kind: "video", url: url2 } : null;
+    }
+    const image = [...dialog.querySelectorAll("img")].filter((el) => Math.max(el.naturalWidth, el.width) > 200).find((el) => isVisible(win, el));
+    if (!image) return null;
+    const url = image.currentSrc || image.src;
+    return url ? { kind: "image", url } : null;
+  }
+  async function waitForActiveStoryMedia(win, dialog, timeoutMs = 1500) {
+    const start = Date.now();
+    let media = activeStoryMedia(win, dialog);
+    while (!media && Date.now() - start < timeoutMs) {
+      await sleep(win, 90);
+      media = activeStoryMedia(win, dialog);
+    }
+    return media;
+  }
+  async function downloadActiveStory(win, dialog, onProgress) {
+    const media = activeStoryMedia(win, dialog);
+    if (!media || !/^https?:/i.test(media.url)) throw new Error("No downloadable story media found");
+    return invokeDownload([media], "instagram-story", onProgress);
+  }
+  async function copyActiveStory(win, dialog) {
+    const media = activeStoryMedia(win, dialog);
+    if (!media || media.kind !== "image") throw new Error("This story has no copyable image");
+    await invoke("copy_image", { url: media.url });
+  }
+  async function downloadAllStories(win, dialog, onProgress) {
+    const total = storySegmentCount(dialog);
+    if (!total) throw new Error("Could not detect story segments");
+    const collected = [];
+    let steppedForward = 0;
+    try {
+      for (let index = 0; index < total; index++) {
+        const media = await waitForActiveStoryMedia(win, dialog);
+        if (media && /^https?:/i.test(media.url) && !collected.some((item) => item.url === media.url)) collected.push(media);
+        onProgress((index + 1) / total * 50);
+        if (index < total - 1) {
+          const next = storyControlButton(dialog, /^next$/i);
+          if (!next) break;
+          next.click();
+          steppedForward++;
+          await sleep(win, 260);
+        }
+      }
+    } finally {
+      const previous = storyControlButton(dialog, /^(previous|go back)$/i);
+      for (let index = 0; index < steppedForward; index++) {
+        previous?.click();
+        await sleep(win, 120);
+      }
+    }
+    if (!collected.length) throw new Error("No downloadable story media found");
+    return invokeDownload(collected, "instagram-story", (percent) => onProgress(50 + percent / 2));
+  }
+  function installStoryMediaActions(win) {
+    if (win.__INSTADESK_STORY_ACTIONS__) return;
+    win.__INSTADESK_STORY_ACTIONS__ = true;
+    const enhance = () => {
+      const dialog = storyDialog(win);
+      if (!dialog || dialog.dataset.instadeskStoryActions !== void 0 || !storySegmentCount(dialog)) return;
+      dialog.dataset.instadeskStoryActions = "";
+      if (win.getComputedStyle(dialog).position === "static") dialog.style.setProperty("position", "relative");
+      const host = win.document.createElement("div");
+      host.style.cssText = "position:absolute;left:12px;bottom:16px;z-index:1000;display:block";
+      const root = host.attachShadow({ mode: "closed" });
+      root.innerHTML = `<style>
+      .actions{display:flex;gap:6px;padding:5px;border:1px solid #ffffff24;border-radius:10px;background:#111115e8;box-shadow:0 4px 18px #0008;backdrop-filter:blur(10px)}
+      button{position:relative;width:30px;height:30px;display:grid;place-items:center;padding:0;border:0;border-radius:7px;background:transparent;color:#eee;cursor:pointer}button:hover{background:#ffffff18}button:active{background:#ffffff26}button:disabled{cursor:progress}
+      svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.ok{color:#6fd58a}.error{color:#ff7676}
+      .ring{position:absolute;inset:1px;border-radius:6px;display:none;place-items:center;background:conic-gradient(#b64bd0 calc(var(--pct,0)*1%),#ffffff22 0)}
+      .ring::after{content:"";position:absolute;inset:2px;border-radius:5px;background:#141418}
+      .pct{position:relative;font:600 9px "Segoe UI",sans-serif;color:#f0f0f3}
+      button.busy .ring{display:grid}button.busy svg{visibility:hidden}
+    </style><div class="actions">
+      <button data-action="copy" title="Copy story image" aria-label="Copy story image"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg><span class="ring"><span class="pct">0</span></span></button>
+      <button data-action="download" title="Download this story" aria-label="Download this story"><svg viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M5 20h14"/></svg><span class="ring"><span class="pct">0</span></span></button>
+      <button data-action="downloadAll" title="Download all stories" aria-label="Download all stories"><svg viewBox="0 0 24 24"><path d="M7 3v10m-4-4 4 4 4-4M17 3v10m-4-4 4 4 4-4M5 20h14"/></svg><span class="ring"><span class="pct">0</span></span></button>
+    </div>`;
+      root.querySelectorAll("button").forEach((button) => {
+        const ring = button.querySelector(".ring");
+        const pct = button.querySelector(".pct");
+        const setProgress = (value) => {
+          const rounded = Math.max(0, Math.min(100, Math.round(value)));
+          ring.style.setProperty("--pct", String(rounded));
+          pct.textContent = String(rounded);
+        };
+        button.addEventListener("click", async (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          button.disabled = true;
+          button.className = "";
+          try {
+            if (button.dataset.action === "copy") {
+              await copyActiveStory(win, dialog);
+            } else {
+              setProgress(0);
+              button.classList.add("busy");
+              if (button.dataset.action === "download") await downloadActiveStory(win, dialog, setProgress);
+              else await downloadAllStories(win, dialog, setProgress);
+            }
+            button.classList.remove("busy");
+            button.classList.add("ok");
+          } catch (error) {
+            button.classList.remove("busy");
+            button.classList.add("error");
+            console.warn("[InstaDesk] story media action failed", error);
+          } finally {
+            win.setTimeout(() => {
+              button.disabled = false;
+              button.className = "";
+            }, 1400);
+          }
+        }, true);
+      });
+      dialog.append(host);
+    };
+    new MutationObserver(enhance).observe(win.document.body, { childList: true, subtree: true });
+    enhance();
+  }
   function installMonitor(win) {
     if (win.__INSTADESK_MONITOR__) return;
     win.__INSTADESK_MONITOR__ = true;
@@ -488,7 +684,9 @@
     installNavigationShortcuts(window);
     const installPageFeatures = () => {
       installContentControls(window);
+      installGhostStories(window);
       installPostMediaActions(window);
+      installStoryMediaActions(window);
       installMonitor(window);
     };
     if (document.body) installPageFeatures();
