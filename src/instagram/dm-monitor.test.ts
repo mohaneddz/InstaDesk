@@ -45,7 +45,7 @@ describe("Instagram DM parser", () => {
 describe("content controls", () => {
   const controls = {
     disableHomeFeed: true, disableReels: true, disableExplore: true, disableSearch: true,
-    disablePosts: true, disableStories: true, disableSuggestions: true
+    disablePosts: true, disableStories: true, disableSuggestions: true, ghostStories: false
   };
   it("blocks selected distraction routes", () => {
     expect(blockedDestination("/", controls)).toBe(true);

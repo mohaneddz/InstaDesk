@@ -23,6 +23,7 @@ export interface ContentControls {
   disablePosts: boolean;
   disableStories: boolean;
   disableSuggestions: boolean;
+  ghostStories: boolean;
 }
 
 const DEFAULT_CONTROLS: ContentControls = {
@@ -32,7 +33,8 @@ const DEFAULT_CONTROLS: ContentControls = {
   disableSearch: false,
   disablePosts: false,
   disableStories: false,
-  disableSuggestions: false
+  disableSuggestions: false,
+  ghostStories: false
 };
 
 const THREAD_RE = /^\/direct\/t\/([^/?#]+)\/?/;
@@ -149,6 +151,8 @@ declare global {
     __INSTADESK_SHORTCUTS__?: boolean;
     __INSTADESK_CONTROLS__?: boolean;
     __INSTADESK_MEDIA_ACTIONS__?: boolean;
+    __INSTADESK_STORY_ACTIONS__?: boolean;
+    __INSTADESK_GHOST__?: boolean;
     __INSTADESK_CONTENT_CONTROLS__?: Partial<ContentControls>;
     __TAURI_INTERNALS__?: { invoke: (command: string, args?: unknown) => Promise<unknown> };
   }
@@ -363,12 +367,16 @@ function downloadableMedia(article: HTMLElement): PostMedia[] {
   return postMediaSources(article).filter((item) => /^https?:/i.test(item.url));
 }
 
+async function invokeDownload(items: PostMedia[], base: string, onProgress: (percent: number) => void): Promise<number> {
+  const onProgressChannel = new Channel<{ overallPercent: number }>();
+  onProgressChannel.onmessage = (message) => onProgress(message.overallPercent);
+  return await invoke<number>("download_media", { items, base, onProgress: onProgressChannel });
+}
+
 async function downloadPostMedia(article: HTMLElement, onProgress: (percent: number) => void): Promise<number> {
   const media = downloadableMedia(article);
   if (!media.length) throw new Error("No downloadable media found in this post");
-  const onProgressChannel = new Channel<{ overallPercent: number }>();
-  onProgressChannel.onmessage = (message) => onProgress(message.overallPercent);
-  return await invoke<number>("download_media", { items: media, base: safePostName(article), onProgress: onProgressChannel });
+  return invokeDownload(media, safePostName(article), onProgress);
 }
 
 async function copyPostImage(article: HTMLElement): Promise<void> {
@@ -439,6 +447,228 @@ export function installPostMediaActions(win: Window): void {
   enhance();
 }
 
+/**
+ * Instagram has no documented "mark as seen" endpoint; the request shape has
+ * shifted between a legacy REST path and a GraphQL mutation carried in the
+ * POST body over the years. Matching both keeps ghost mode working across
+ * that drift, but it stays a heuristic — a future rename can silently defeat
+ * it, the same tradeoff the content-control heuristics above already accept.
+ */
+const STORY_SEEN_URL_PATTERN = /stor(y|ies)[_-]?(seen|viewed)|reel[_-]?(media[_-]?)?seen|seen[_-]?stor(y|ies)|media\/seen/i;
+const STORY_SEEN_BODY_PATTERN = /reel[_-]?seen|stor(y|ies)[_-]?seen|seenState|PolarisStoriesV3ReelSeenMutation/i;
+
+function looksLikeStorySeenRequest(url: string, body?: string): boolean {
+  if (STORY_SEEN_URL_PATTERN.test(url)) return true;
+  return Boolean(body && url.includes("/graphql/") && STORY_SEEN_BODY_PATTERN.test(body));
+}
+
+/** Suppresses the network calls that report a story view while leaving media loads untouched. */
+export function installGhostStories(win: Window): void {
+  if (win.__INSTADESK_GHOST__) return;
+  win.__INSTADESK_GHOST__ = true;
+  const enabled = () => Boolean(win.__INSTADESK_CONTENT_CONTROLS__?.ghostStories);
+
+  const nativeFetch = win.fetch.bind(win);
+  win.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    try {
+      const raw = typeof input === "string" || input instanceof URL ? input.toString() : input.url;
+      const body = typeof init?.body === "string" ? init.body : undefined;
+      if (enabled() && looksLikeStorySeenRequest(raw, body)) {
+        console.debug("[InstaDesk] ghost mode suppressed a story view receipt");
+        return new Response(null, { status: 204 });
+      }
+    } catch { /* Fall through to the real request on any inspection failure. */ }
+    return nativeFetch(input, init);
+  }) as typeof fetch;
+
+  const XHR = (win as unknown as { XMLHttpRequest: typeof XMLHttpRequest }).XMLHttpRequest.prototype as XMLHttpRequest & { __instadeskUrl?: string };
+  const nativeOpen = XHR.open;
+  const nativeSend = XHR.send;
+  XHR.open = function (this: XMLHttpRequest & { __instadeskUrl?: string }, method: string, url: string | URL, ...rest: unknown[]) {
+    this.__instadeskUrl = String(url);
+    return (nativeOpen as (...args: unknown[]) => void).apply(this, [method, url, ...rest]);
+  } as typeof XHR.open;
+  XHR.send = function (this: XMLHttpRequest & { __instadeskUrl?: string }, body?: Document | XMLHttpRequestBodyInit | null) {
+    const url = this.__instadeskUrl;
+    const bodyText = typeof body === "string" ? body : undefined;
+    if (enabled() && url && looksLikeStorySeenRequest(url, bodyText)) {
+      console.debug("[InstaDesk] ghost mode suppressed a story view receipt (xhr)");
+      win.setTimeout(() => {
+        Object.defineProperty(this, "readyState", { value: 4, configurable: true });
+        Object.defineProperty(this, "status", { value: 204, configurable: true });
+        this.dispatchEvent(new Event("readystatechange"));
+        this.dispatchEvent(new Event("load"));
+        this.dispatchEvent(new Event("loadend"));
+      }, 0);
+      return;
+    }
+    return (nativeSend as (this: XMLHttpRequest, body?: unknown) => void).call(this, body);
+  } as typeof XHR.send;
+}
+
+function sleep(win: Window, ms: number): Promise<void> {
+  return new Promise((resolve) => win.setTimeout(resolve, ms));
+}
+
+function storyDialog(win: Window): HTMLElement | null {
+  return win.document.querySelector<HTMLElement>('div[role="dialog"]');
+}
+
+function storySegmentCount(dialog: HTMLElement): number {
+  return dialog.querySelectorAll('[role="progressbar"]').length;
+}
+
+function storyControlButton(dialog: HTMLElement, label: RegExp): HTMLElement | null {
+  for (const button of dialog.querySelectorAll<HTMLElement>('button,[role="button"]')) {
+    if (label.test(button.getAttribute("aria-label") ?? "")) return button;
+  }
+  return null;
+}
+
+function isVisible(win: Window, element: Element): boolean {
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 50 || rect.height < 50) return false;
+  if (element.closest('[aria-hidden="true"]')) return false;
+  const style = win.getComputedStyle(element);
+  return style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity || "1") > 0.05;
+}
+
+/** Finds the media element for the segment currently playing, ignoring preloaded neighbors. */
+function activeStoryMedia(win: Window, dialog: HTMLElement): PostMedia | null {
+  const video = [...dialog.querySelectorAll<HTMLVideoElement>("video")].find((el) => isVisible(win, el));
+  if (video) {
+    const url = video.currentSrc || video.src;
+    return url ? { kind: "video", url } : null;
+  }
+  const image = [...dialog.querySelectorAll<HTMLImageElement>("img")]
+    .filter((el) => Math.max(el.naturalWidth, el.width) > 200)
+    .find((el) => isVisible(win, el));
+  if (!image) return null;
+  const url = image.currentSrc || image.src;
+  return url ? { kind: "image", url } : null;
+}
+
+async function waitForActiveStoryMedia(win: Window, dialog: HTMLElement, timeoutMs = 1500): Promise<PostMedia | null> {
+  const start = Date.now();
+  let media = activeStoryMedia(win, dialog);
+  while (!media && Date.now() - start < timeoutMs) {
+    await sleep(win, 90);
+    media = activeStoryMedia(win, dialog);
+  }
+  return media;
+}
+
+async function downloadActiveStory(win: Window, dialog: HTMLElement, onProgress: (percent: number) => void): Promise<number> {
+  const media = activeStoryMedia(win, dialog);
+  if (!media || !/^https?:/i.test(media.url)) throw new Error("No downloadable story media found");
+  return invokeDownload([media], "instagram-story", onProgress);
+}
+
+async function copyActiveStory(win: Window, dialog: HTMLElement): Promise<void> {
+  const media = activeStoryMedia(win, dialog);
+  if (!media || media.kind !== "image") throw new Error("This story has no copyable image");
+  await invoke("copy_image", { url: media.url });
+}
+
+/**
+ * Walks forward through every segment in the current story ring, collecting
+ * whatever media is loaded along the way, then returns to the segment the
+ * user started on. Only segments Instagram has already rendered are seen —
+ * there is no API to fetch the full ring without stepping through it.
+ */
+async function downloadAllStories(win: Window, dialog: HTMLElement, onProgress: (percent: number) => void): Promise<number> {
+  const total = storySegmentCount(dialog);
+  if (!total) throw new Error("Could not detect story segments");
+  const collected: PostMedia[] = [];
+  let steppedForward = 0;
+  try {
+    for (let index = 0; index < total; index++) {
+      const media = await waitForActiveStoryMedia(win, dialog);
+      if (media && /^https?:/i.test(media.url) && !collected.some((item) => item.url === media.url)) collected.push(media);
+      onProgress(((index + 1) / total) * 50);
+      if (index < total - 1) {
+        const next = storyControlButton(dialog, /^next$/i);
+        if (!next) break;
+        next.click();
+        steppedForward++;
+        await sleep(win, 260);
+      }
+    }
+  } finally {
+    const previous = storyControlButton(dialog, /^(previous|go back)$/i);
+    for (let index = 0; index < steppedForward; index++) {
+      previous?.click();
+      await sleep(win, 120);
+    }
+  }
+  if (!collected.length) throw new Error("No downloadable story media found");
+  return invokeDownload(collected, "instagram-story", (percent) => onProgress(50 + percent / 2));
+}
+
+/** Adds copy/download/download-all actions to the open story viewer, mirroring the post action bar. */
+export function installStoryMediaActions(win: Window): void {
+  if (win.__INSTADESK_STORY_ACTIONS__) return;
+  win.__INSTADESK_STORY_ACTIONS__ = true;
+  const enhance = () => {
+    const dialog = storyDialog(win);
+    if (!dialog || dialog.dataset.instadeskStoryActions !== undefined || !storySegmentCount(dialog)) return;
+    dialog.dataset.instadeskStoryActions = "";
+    if (win.getComputedStyle(dialog).position === "static") dialog.style.setProperty("position", "relative");
+    const host = win.document.createElement("div");
+    host.style.cssText = "position:absolute;left:12px;bottom:16px;z-index:1000;display:block";
+    const root = host.attachShadow({ mode: "closed" });
+    root.innerHTML = `<style>
+      .actions{display:flex;gap:6px;padding:5px;border:1px solid #ffffff24;border-radius:10px;background:#111115e8;box-shadow:0 4px 18px #0008;backdrop-filter:blur(10px)}
+      button{position:relative;width:30px;height:30px;display:grid;place-items:center;padding:0;border:0;border-radius:7px;background:transparent;color:#eee;cursor:pointer}button:hover{background:#ffffff18}button:active{background:#ffffff26}button:disabled{cursor:progress}
+      svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.ok{color:#6fd58a}.error{color:#ff7676}
+      .ring{position:absolute;inset:1px;border-radius:6px;display:none;place-items:center;background:conic-gradient(#b64bd0 calc(var(--pct,0)*1%),#ffffff22 0)}
+      .ring::after{content:"";position:absolute;inset:2px;border-radius:5px;background:#141418}
+      .pct{position:relative;font:600 9px "Segoe UI",sans-serif;color:#f0f0f3}
+      button.busy .ring{display:grid}button.busy svg{visibility:hidden}
+    </style><div class="actions">
+      <button data-action="copy" title="Copy story image" aria-label="Copy story image"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg><span class="ring"><span class="pct">0</span></span></button>
+      <button data-action="download" title="Download this story" aria-label="Download this story"><svg viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M5 20h14"/></svg><span class="ring"><span class="pct">0</span></span></button>
+      <button data-action="downloadAll" title="Download all stories" aria-label="Download all stories"><svg viewBox="0 0 24 24"><path d="M7 3v10m-4-4 4 4 4-4M17 3v10m-4-4 4 4 4-4M5 20h14"/></svg><span class="ring"><span class="pct">0</span></span></button>
+    </div>`;
+    root.querySelectorAll<HTMLButtonElement>("button").forEach((button) => {
+      const ring = button.querySelector<HTMLElement>(".ring")!;
+      const pct = button.querySelector<HTMLElement>(".pct")!;
+      const setProgress = (value: number) => {
+        const rounded = Math.max(0, Math.min(100, Math.round(value)));
+        ring.style.setProperty("--pct", String(rounded));
+        pct.textContent = String(rounded);
+      };
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        button.disabled = true;
+        button.className = "";
+        try {
+          if (button.dataset.action === "copy") {
+            await copyActiveStory(win, dialog);
+          } else {
+            setProgress(0);
+            button.classList.add("busy");
+            if (button.dataset.action === "download") await downloadActiveStory(win, dialog, setProgress);
+            else await downloadAllStories(win, dialog, setProgress);
+          }
+          button.classList.remove("busy");
+          button.classList.add("ok");
+        } catch (error) {
+          button.classList.remove("busy");
+          button.classList.add("error");
+          console.warn("[InstaDesk] story media action failed", error);
+        } finally {
+          win.setTimeout(() => { button.disabled = false; button.className = ""; }, 1400);
+        }
+      }, true);
+    });
+    dialog.append(host);
+  };
+  new MutationObserver(enhance).observe(win.document.body, { childList: true, subtree: true });
+  enhance();
+}
+
 export function installMonitor(win: Window): void {
   if (win.__INSTADESK_MONITOR__) return;
   win.__INSTADESK_MONITOR__ = true;
@@ -487,7 +717,9 @@ if (typeof window !== "undefined" && location.hostname.endsWith("instagram.com")
   installNavigationShortcuts(window);
   const installPageFeatures = () => {
     installContentControls(window);
+    installGhostStories(window);
     installPostMediaActions(window);
+    installStoryMediaActions(window);
     installMonitor(window);
   };
   if (document.body) installPageFeatures();
