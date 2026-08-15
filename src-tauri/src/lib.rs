@@ -513,6 +513,191 @@ fn get_content_controls(app: AppHandle, webview: Webview) -> Result<Settings, St
         .map_err(|_| "settings lock poisoned".into())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaItem {
+    #[allow(dead_code)]
+    kind: String,
+    url: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgress {
+    index: usize,
+    count: usize,
+    overall_percent: f64,
+}
+
+/// Instagram serves post media from its own CDN hosts; only those are fetchable.
+fn is_instagram_media_url(raw: &str) -> Option<url::Url> {
+    let url = url::Url::parse(raw).ok()?;
+    let host = url.host_str()?;
+    (url.scheme() == "https"
+        && (host.ends_with(".cdninstagram.com")
+            || host == "cdninstagram.com"
+            || host.ends_with(".fbcdn.net")
+            || host.ends_with(".instagram.com")
+            || host == "instagram.com"))
+    .then_some(url)
+}
+
+fn media_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 InstaDesk")
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn unique_download_path(dir: &std::path::Path, name: &str, ext: &str) -> std::path::PathBuf {
+    let mut candidate = dir.join(format!("{name}.{ext}"));
+    let mut counter = 2;
+    while candidate.exists() {
+        candidate = dir.join(format!("{name}-{counter}.{ext}"));
+        counter += 1;
+    }
+    candidate
+}
+
+fn extension_for(url: &url::Url, content_type: Option<&str>, kind: &str) -> String {
+    if let Some(ext) = std::path::Path::new(url.path())
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| value.chars().all(|c| c.is_ascii_alphanumeric()) && value.len() <= 5)
+    {
+        return ext.to_ascii_lowercase();
+    }
+    match content_type.and_then(|value| value.split('/').nth(1)).map(|value| value.split(';').next().unwrap_or("").trim()) {
+        Some("jpeg") => "jpg".into(),
+        Some(subtype) if !subtype.is_empty() && subtype.chars().all(|c| c.is_ascii_alphanumeric()) => subtype.to_ascii_lowercase(),
+        _ if kind == "video" => "mp4".into(),
+        _ => "jpg".into(),
+    }
+}
+
+#[tauri::command]
+async fn download_media(
+    app: AppHandle,
+    webview: Webview,
+    items: Vec<MediaItem>,
+    base: String,
+    on_progress: tauri::ipc::Channel<DownloadProgress>,
+) -> Result<usize, String> {
+    use futures_util::StreamExt;
+    if webview.label() != "instagram" {
+        return Err("Downloads are available only to the Instagram WebView".into());
+    }
+    let targets: Vec<url::Url> = items
+        .iter()
+        .filter_map(|item| is_instagram_media_url(&item.url))
+        .collect();
+    if targets.is_empty() {
+        return Err("No downloadable Instagram media was found in this post".into());
+    }
+    let dir = app
+        .path()
+        .download_dir()
+        .map_err(|error| format!("Could not locate the Downloads folder: {error}"))?;
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let safe_base = {
+        let cleaned: String = base
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+            .collect();
+        if cleaned.trim_matches('-').is_empty() { "instagram-post".to_string() } else { cleaned }
+    };
+    let client = media_client()?;
+    let count = targets.len();
+    let mut saved = 0usize;
+    for (index, url) in targets.into_iter().enumerate() {
+        let kind = items
+            .get(index)
+            .map(|item| item.kind.as_str())
+            .unwrap_or("image");
+        let response = client
+            .get(url.clone())
+            .header(reqwest::header::REFERER, "https://www.instagram.com/")
+            .send()
+            .await
+            .map_err(|error| format!("Media request failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("Media request failed ({})", response.status()));
+        }
+        let total = response.content_length().unwrap_or(0);
+        let ext = extension_for(
+            &url,
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            kind,
+        );
+        let mut buffer: Vec<u8> = Vec::with_capacity(total as usize);
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| format!("Download interrupted: {error}"))?;
+            buffer.extend_from_slice(&chunk);
+            let item_fraction = if total > 0 {
+                (buffer.len() as f64 / total as f64).min(1.0)
+            } else {
+                0.0
+            };
+            let overall = ((index as f64 + item_fraction) / count as f64) * 100.0;
+            let _ = on_progress.send(DownloadProgress {
+                index,
+                count,
+                overall_percent: overall,
+            });
+        }
+        let name = if count > 1 {
+            format!("{safe_base}-{}", index + 1)
+        } else {
+            safe_base.clone()
+        };
+        let path = unique_download_path(&dir, &name, &ext);
+        fs::write(&path, &buffer).map_err(|error| format!("Could not save media: {error}"))?;
+        saved += 1;
+        let _ = on_progress.send(DownloadProgress {
+            index,
+            count,
+            overall_percent: ((index as f64 + 1.0) / count as f64) * 100.0,
+        });
+    }
+    Ok(saved)
+}
+
+#[tauri::command]
+async fn copy_image(webview: Webview, url: String) -> Result<(), String> {
+    if webview.label() != "instagram" {
+        return Err("Clipboard copy is available only to the Instagram WebView".into());
+    }
+    let target = is_instagram_media_url(&url).ok_or("Rejected non-Instagram media URL")?;
+    let client = media_client()?;
+    let bytes = client
+        .get(target)
+        .header(reqwest::header::REFERER, "https://www.instagram.com/")
+        .send()
+        .await
+        .map_err(|error| format!("Image request failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Image request failed: {error}"))?
+        .bytes()
+        .await
+        .map_err(|error| error.to_string())?;
+    let image = image::load_from_memory(&bytes)
+        .map_err(|error| format!("Could not decode image: {error}"))?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    let mut clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;
+    clipboard
+        .set_image(arboard::ImageData {
+            width: width as usize,
+            height: height as usize,
+            bytes: std::borrow::Cow::from(image.into_raw()),
+        })
+        .map_err(|error| format!("Could not write image to clipboard: {error}"))
+}
+
 #[tauri::command]
 fn window_action(app: AppHandle, webview: Webview, action: &str) -> Result<(), String> {
     let window = webview.window();
@@ -732,7 +917,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--hidden"])))
-        .invoke_handler(tauri::generate_handler![incoming_private_dm, get_settings, update_settings, get_content_controls, window_action, settings_ui_ready])
+        .invoke_handler(tauri::generate_handler![incoming_private_dm, get_settings, update_settings, get_content_controls, window_action, settings_ui_ready, download_media, copy_image])
         .setup(|app| {
             let settings = load_settings(app.handle());
             app.manage(AppState { settings: Mutex::new(settings.clone()), dedup: Mutex::new((HashSet::new(), VecDeque::new())), quitting: Mutex::new(false) });

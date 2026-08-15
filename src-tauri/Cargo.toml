@@ -20,6 +20,10 @@ tauri = { version = "2", features = ["tray-icon", "unstable"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-notification = "2"
 url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+arboard = "3"
 
 [target.'cfg(windows)'.dependencies]
 notify-rust = "4.18"

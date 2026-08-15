@@ -11,6 +11,8 @@
     "allow-get-content-controls",
     "allow-window-action",
     "allow-settings-ui-ready",
+    "allow-download-media",
+    "allow-copy-image",
     "autostart:default",
     "notification:default",
     "core:window:allow-start-dragging",
