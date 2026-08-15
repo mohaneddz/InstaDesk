@@ -13,6 +13,7 @@ interface Settings {
   disablePosts: boolean;
   disableStories: boolean;
   disableSuggestions: boolean;
+  ghostStories: boolean;
 }
 
 const app = document.querySelector<HTMLElement>("#app")!;
@@ -40,6 +41,10 @@ app.innerHTML = `
       <label><span><b>Disable Stories</b><small>Hide the stories row from Home.</small></span><input id="disableStories" type="checkbox"><i></i></label>
       <label><span><b>Disable Suggestions</b><small>Hide suggested accounts and center the feed.</small></span><input id="disableSuggestions" type="checkbox"><i></i></label>
     </div>
+    <div class="section-heading"><span><b>Story privacy</b><small>Control what viewing a story reports back.</small></span></div>
+    <div class="settings-list">
+      <label><span><b>Ghost story viewer</b><small>View stories without sending a seen receipt.</small></span><input id="ghostStories" type="checkbox"><i></i></label>
+    </div>
     <section class="shortcuts" aria-labelledby="shortcuts-title">
       <div class="shortcuts-copy"><b id="shortcuts-title">Navigation shortcuts</b><small>Move through your Instagram history.</small></div>
       <div class="shortcut-list">
@@ -54,7 +59,7 @@ const status = document.querySelector<HTMLElement>("#status")!;
 const keys: (keyof Settings)[] = [
   "notifications", "notificationPreviews", "minimizeToTray", "launchAtStartup",
   "disableHomeFeed", "disableReels", "disableExplore", "disableSearch",
-  "disablePosts", "disableStories", "disableSuggestions"
+  "disablePosts", "disableStories", "disableSuggestions", "ghostStories"
 ];
 let current: Settings;
 void invoke("settings_ui_ready");
