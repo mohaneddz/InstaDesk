@@ -1,5 +1,85 @@
 "use strict";
 (() => {
+  // node_modules/@tauri-apps/api/external/tslib/tslib.es6.js
+  function __classPrivateFieldGet(receiver, state, kind, f) {
+    if (kind === "a" && !f) throw new TypeError("Private accessor was defined without a getter");
+    if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot read private member from an object whose class did not declare it");
+    return kind === "m" ? f : kind === "a" ? f.call(receiver) : f ? f.value : state.get(receiver);
+  }
+  function __classPrivateFieldSet(receiver, state, value, kind, f) {
+    if (kind === "m") throw new TypeError("Private method is not writable");
+    if (kind === "a" && !f) throw new TypeError("Private accessor was defined without a setter");
+    if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot write private member to an object whose class did not declare it");
+    return kind === "a" ? f.call(receiver, value) : f ? f.value = value : state.set(receiver, value), value;
+  }
+
+  // node_modules/@tauri-apps/api/core.js
+  var _Channel_onmessage;
+  var _Channel_nextMessageIndex;
+  var _Channel_pendingMessages;
+  var _Channel_messageEndIndex;
+  var _Resource_rid;
+  var SERIALIZE_TO_IPC_FN = "__TAURI_TO_IPC_KEY__";
+  function transformCallback(callback, once = false) {
+    return window.__TAURI_INTERNALS__.transformCallback(callback, once);
+  }
+  var Channel = class {
+    constructor(onmessage) {
+      _Channel_onmessage.set(this, void 0);
+      _Channel_nextMessageIndex.set(this, 0);
+      _Channel_pendingMessages.set(this, []);
+      _Channel_messageEndIndex.set(this, void 0);
+      __classPrivateFieldSet(this, _Channel_onmessage, onmessage || (() => {
+      }), "f");
+      this.id = transformCallback((rawMessage) => {
+        const index = rawMessage.index;
+        if ("end" in rawMessage) {
+          if (index == __classPrivateFieldGet(this, _Channel_nextMessageIndex, "f")) {
+            this.cleanupCallback();
+          } else {
+            __classPrivateFieldSet(this, _Channel_messageEndIndex, index, "f");
+          }
+          return;
+        }
+        const message = rawMessage.message;
+        if (index == __classPrivateFieldGet(this, _Channel_nextMessageIndex, "f")) {
+          __classPrivateFieldGet(this, _Channel_onmessage, "f").call(this, message);
+          __classPrivateFieldSet(this, _Channel_nextMessageIndex, __classPrivateFieldGet(this, _Channel_nextMessageIndex, "f") + 1, "f");
+          while (__classPrivateFieldGet(this, _Channel_nextMessageIndex, "f") in __classPrivateFieldGet(this, _Channel_pendingMessages, "f")) {
+            const message2 = __classPrivateFieldGet(this, _Channel_pendingMessages, "f")[__classPrivateFieldGet(this, _Channel_nextMessageIndex, "f")];
+            __classPrivateFieldGet(this, _Channel_onmessage, "f").call(this, message2);
+            delete __classPrivateFieldGet(this, _Channel_pendingMessages, "f")[__classPrivateFieldGet(this, _Channel_nextMessageIndex, "f")];
+            __classPrivateFieldSet(this, _Channel_nextMessageIndex, __classPrivateFieldGet(this, _Channel_nextMessageIndex, "f") + 1, "f");
+          }
+          if (__classPrivateFieldGet(this, _Channel_nextMessageIndex, "f") === __classPrivateFieldGet(this, _Channel_messageEndIndex, "f")) {
+            this.cleanupCallback();
+          }
+        } else {
+          __classPrivateFieldGet(this, _Channel_pendingMessages, "f")[index] = message;
+        }
+      });
+    }
+    cleanupCallback() {
+      window.__TAURI_INTERNALS__.unregisterCallback(this.id);
+    }
+    set onmessage(handler) {
+      __classPrivateFieldSet(this, _Channel_onmessage, handler, "f");
+    }
+    get onmessage() {
+      return __classPrivateFieldGet(this, _Channel_onmessage, "f");
+    }
+    [(_Channel_onmessage = /* @__PURE__ */ new WeakMap(), _Channel_nextMessageIndex = /* @__PURE__ */ new WeakMap(), _Channel_pendingMessages = /* @__PURE__ */ new WeakMap(), _Channel_messageEndIndex = /* @__PURE__ */ new WeakMap(), SERIALIZE_TO_IPC_FN)]() {
+      return `__CHANNEL__:${this.id}`;
+    }
+    toJSON() {
+      return this[SERIALIZE_TO_IPC_FN]();
+    }
+  };
+  async function invoke(cmd, args = {}, options) {
+    return window.__TAURI_INTERNALS__.invoke(cmd, args, options);
+  }
+  _Resource_rid = /* @__PURE__ */ new WeakMap();
+
   // src/instagram/dm-monitor.ts
   var DEFAULT_CONTROLS = {
     disableHomeFeed: false,
@@ -162,32 +242,31 @@
       element.dataset.instadeskHidden = "";
       element.style.setProperty("display", "none", "important");
     };
+    const enclosingBlock = (start, root) => {
+      let block = start;
+      for (let depth = 0; depth < 8; depth++) {
+        const parent = block.parentElement;
+        if (!parent || parent === root || parent === win.document.body) break;
+        if (parent.querySelector("article") || parent.querySelector('nav,[role="navigation"]')) break;
+        block = parent;
+      }
+      return block;
+    };
     const applySemanticLayout = () => {
       restoreLayout();
       const main = win.document.querySelector("main");
       if (!main) return;
       if (controls.disableStories) {
-        const storyLinks = [...main.querySelectorAll('a[href*="/stories/"]')];
-        if (storyLinks.length) {
-          let storySection = storyLinks[0];
-          while (storySection.parentElement && storySection.parentElement !== main && !storySection.parentElement.querySelector("article")) {
-            storySection = storySection.parentElement;
-          }
-          hide(storySection);
-        }
+        const storyLink = main.querySelector('a[href*="/stories/"]') ?? main.querySelector(`[aria-label*="story" i][role="button"], [aria-label$="\u2019s story" i]`);
+        if (storyLink) hide(enclosingBlock(storyLink, main));
       }
       if (controls.disableSuggestions) {
-        const heading = [...main.querySelectorAll("div,span")].find((element) => /^Suggested for you$/i.test(normalizedText(element)));
-        let suggestionSection = heading ?? null;
-        while (suggestionSection?.parentElement && suggestionSection.parentElement !== main && !suggestionSection.parentElement.querySelector("article")) {
-          suggestionSection = suggestionSection.parentElement;
-          if (suggestionSection.querySelectorAll("a[href]").length >= 3 && /See all/i.test(normalizedText(suggestionSection))) break;
-        }
-        hide(suggestionSection);
+        const headings = [...win.document.querySelectorAll("span,div,h1,h2,h3,h4")].filter((element) => element.childElementCount === 0 && /^Suggested for you$/i.test(normalizedText(element)));
+        for (const heading of headings) hide(enclosingBlock(heading, main));
         const article = main.querySelector("article");
         if (article) {
           let feedColumn = article.parentElement;
-          while (feedColumn?.parentElement && feedColumn.parentElement !== main && !/Suggested for you/i.test(normalizedText(feedColumn.parentElement))) {
+          while (feedColumn?.parentElement && feedColumn.parentElement !== main && feedColumn.parentElement.childElementCount < 2) {
             feedColumn = feedColumn.parentElement;
           }
           if (feedColumn) {
@@ -281,46 +360,20 @@
     const profile = article.querySelector('header a[href^="/"]')?.getAttribute("href")?.split("/").filter(Boolean)[0];
     return (profile || "instagram-post").replace(/[^A-Za-z0-9._-]/g, "-");
   }
-  function extensionFor(blob, kind) {
-    const subtype = blob.type.split("/")[1]?.split(";")[0]?.replace("jpeg", "jpg");
-    return subtype && /^[a-z0-9]+$/i.test(subtype) ? subtype : kind === "video" ? "mp4" : "jpg";
+  function downloadableMedia(article) {
+    return postMediaSources(article).filter((item) => /^https?:/i.test(item.url));
   }
-  async function fetchPostBlob(media) {
-    const response = await fetch(media.url, { credentials: "include" });
-    if (!response.ok) throw new Error(`Media request failed (${response.status})`);
-    return response.blob();
-  }
-  async function downloadPostMedia(article) {
-    const media = postMediaSources(article);
+  async function downloadPostMedia(article, onProgress) {
+    const media = downloadableMedia(article);
     if (!media.length) throw new Error("No downloadable media found in this post");
-    const name = safePostName(article);
-    for (let index = 0; index < media.length; index++) {
-      const blob = await fetchPostBlob(media[index]);
-      const objectUrl = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = objectUrl;
-      link.download = `${name}-${index + 1}.${extensionFor(blob, media[index].kind)}`;
-      link.hidden = true;
-      document.body.append(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 3e4);
-    }
-    return media.length;
+    const onProgressChannel = new Channel();
+    onProgressChannel.onmessage = (message) => onProgress(message.overallPercent);
+    return await invoke("download_media", { items: media, base: safePostName(article), onProgress: onProgressChannel });
   }
   async function copyPostImage(article) {
-    const image = postMediaSources(article).find((item) => item.kind === "image");
+    const image = downloadableMedia(article).find((item) => item.kind === "image");
     if (!image) throw new Error("This post has no copyable image");
-    if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") throw new Error("Image clipboard access is unavailable");
-    const source = await fetchPostBlob(image);
-    const bitmap = await createImageBitmap(source);
-    const canvas = document.createElement("canvas");
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-    canvas.getContext("2d").drawImage(bitmap, 0, 0);
-    bitmap.close();
-    const png = await new Promise((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("Could not encode image")), "image/png"));
-    await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+    await invoke("copy_image", { url: image.url });
   }
   function installPostMediaActions(win) {
     if (win.__INSTADESK_MEDIA_ACTIONS__) return;
@@ -334,31 +387,51 @@
         const root = host.attachShadow({ mode: "closed" });
         root.innerHTML = `<style>
         .actions{display:flex;gap:6px;padding:5px;border:1px solid #ffffff24;border-radius:10px;background:#111115e8;box-shadow:0 4px 18px #0008;backdrop-filter:blur(10px)}
-        button{width:30px;height:30px;display:grid;place-items:center;padding:0;border:0;border-radius:7px;background:transparent;color:#eee;cursor:pointer}button:hover{background:#ffffff18}button:active{background:#ffffff26}button:disabled{opacity:.55;cursor:wait}
+        button{position:relative;width:30px;height:30px;display:grid;place-items:center;padding:0;border:0;border-radius:7px;background:transparent;color:#eee;cursor:pointer}button:hover{background:#ffffff18}button:active{background:#ffffff26}button:disabled{cursor:progress}
         svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.ok{color:#6fd58a}.error{color:#ff7676}
+        .ring{position:absolute;inset:1px;border-radius:6px;display:none;place-items:center;background:conic-gradient(#b64bd0 calc(var(--pct,0)*1%),#ffffff22 0)}
+        .ring::after{content:"";position:absolute;inset:2px;border-radius:5px;background:#141418}
+        .pct{position:relative;font:600 9px "Segoe UI",sans-serif;color:#f0f0f3}
+        button.busy .ring{display:grid}button.busy svg{visibility:hidden}
       </style><div class="actions">
-        <button data-action="download" title="Download all post media" aria-label="Download all post media"><svg viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M5 20h14"/></svg></button>
-        <button data-action="copy" title="Copy post image" aria-label="Copy post image"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button>
+        <button data-action="download" title="Download all post media" aria-label="Download all post media"><svg viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M5 20h14"/></svg><span class="ring"><span class="pct">0</span></span></button>
+        <button data-action="copy" title="Copy post image" aria-label="Copy post image"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg><span class="ring"><span class="pct">0</span></span></button>
       </div>`;
-        root.querySelectorAll("button").forEach((button) => button.addEventListener("click", async (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          button.disabled = true;
-          button.className = "";
-          try {
-            if (button.dataset.action === "download") await downloadPostMedia(article);
-            else await copyPostImage(article);
-            button.classList.add("ok");
-          } catch (error) {
-            button.classList.add("error");
-            console.warn("[InstaDesk] post media action failed", error);
-          } finally {
-            win.setTimeout(() => {
-              button.disabled = false;
-              button.className = "";
-            }, 1200);
-          }
-        }, true));
+        root.querySelectorAll("button").forEach((button) => {
+          const ring = button.querySelector(".ring");
+          const pct = button.querySelector(".pct");
+          const setProgress = (value) => {
+            const rounded = Math.max(0, Math.min(100, Math.round(value)));
+            ring.style.setProperty("--pct", String(rounded));
+            pct.textContent = String(rounded);
+          };
+          button.addEventListener("click", async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            button.disabled = true;
+            button.className = "";
+            try {
+              if (button.dataset.action === "download") {
+                setProgress(0);
+                button.classList.add("busy");
+                await downloadPostMedia(article, setProgress);
+              } else {
+                await copyPostImage(article);
+              }
+              button.classList.remove("busy");
+              button.classList.add("ok");
+            } catch (error) {
+              button.classList.remove("busy");
+              button.classList.add("error");
+              console.warn("[InstaDesk] post media action failed", error);
+            } finally {
+              win.setTimeout(() => {
+                button.disabled = false;
+                button.className = "";
+              }, 1400);
+            }
+          }, true);
+        });
         article.append(host);
       }
     };
