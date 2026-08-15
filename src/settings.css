@@ -1,6 +1,7 @@
-:root { font-family: "Segoe UI Variable", "Segoe UI", sans-serif; color: #f5f5f7; background: #111116; color-scheme: dark; }
+:root { font-family: "Segoe UI Variable", "Segoe UI", sans-serif; color: #f5f5f7; background: #111116; color-scheme: dark; height: 100%; }
 * { box-sizing: border-box; }
-body { margin: 0; height: 100vh; overflow: hidden; display: flex; flex-direction: column; background: radial-gradient(circle at 85% -5%, #5b245c55, transparent 42%), #111116; }
+html { height: 100%; }
+body { margin: 0; height: 100%; overflow: hidden; display: flex; flex-direction: column; background: radial-gradient(circle at 85% -5%, #5b245c55, transparent 42%), #111116; }
 #app { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 button, input { font: inherit; }
 .fallback { flex: 1; display: grid; place-content: center; justify-items: center; gap: 12px; color: #e9e9ec; }
@@ -11,7 +12,7 @@ button, input { font: inherit; }
 .app-icon { display: grid; place-items: center; width: 21px; height: 21px; border-radius: 6px; font-size: 8px; font-weight: 800; background: linear-gradient(135deg,#8045db,#df3f70,#f7a63b); }
 .close { width: 46px; height: 38px; border: 0; color: #ddd; background: transparent; font-size: 22px; line-height: 1; }
 .close:hover { background: #c42b1c; color: white; }
-.content { flex: 1; min-height: 0; padding: 20px 28px 16px; overflow-y: auto; scrollbar-color: #575761 transparent; scrollbar-width: thin; }
+.content { flex: 1; min-height: 0; padding: 20px 28px 16px; overflow-y: auto; overflow-anchor: none; scrollbar-color: #575761 transparent; scrollbar-width: thin; transform: translateZ(0); }
 .content::-webkit-scrollbar { width: 8px; }.content::-webkit-scrollbar-thumb { background: #575761; border: 2px solid transparent; border-radius: 8px; background-clip: padding-box; }
 h1 { margin: 0; font-size: 23px; line-height: 26px; font-weight: 650; } .lead { margin: 4px 0 16px; color: #9999a3; font-size: 13px; line-height: 18px; }
 .settings-list { overflow: hidden; border: 1px solid #ffffff16; border-radius: 13px; background: #1a1a20cc; }
