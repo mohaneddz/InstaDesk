@@ -1,51 +1,70 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { blockedDestination, classifyThread, installContentControls, installNavigationShortcuts, parseCurrentThread, postMediaSources, threadIdFromPath } from "./dm-monitor";
+import { blockedDestination, classifyThread, inboxRowKind, installContentControls, installNavigationShortcuts, parseInboxList, postMediaSources, threadIdFromPath } from "./dm-monitor";
 
-const location = { pathname: "/direct/t/123/", href: "https://www.instagram.com/direct/t/123/" } as Location;
 function page(header: string, rows: string): Document {
   document.body.innerHTML = `<main><header>${header}</header><section>${rows}</section></main>`;
   return document;
 }
 
-describe("Instagram DM parser", () => {
+describe("Instagram thread classifier", () => {
   it("extracts thread ids only from conversation URLs", () => {
     expect(threadIdFromPath("/direct/t/123/")).toBe("123");
     expect(threadIdFromPath("/direct/inbox/")).toBeNull();
   });
-  it("accepts a private peer and received message", () => {
-    const doc = page('<a href="/sarah/" aria-label="Sarah">Sarah</a>', '<div data-message-id="m1" aria-label="Received from Sarah: bro look at this">bro look at this</div>');
-    expect(parseCurrentThread(doc, location)).toMatchObject([{ conversationId: "123", sender: "Sarah", preview: "bro look at this", messageKey: "m1" }]);
+  it("identifies a private 1:1 thread from its header", () => {
+    const doc = page('<a href="/sarah/" aria-label="Sarah">Sarah</a>', "");
+    expect(classifyThread(doc)).toMatchObject({ kind: "private", peer: "Sarah" });
   });
-  it("rejects groups", () => {
-    const doc = page('<a href="/sarah/">Sarah</a><a href="/alex/">Alex</a>', '<div data-message-id="m1" aria-label="Received from Sarah: hello">hello</div>');
+  it("classifies groups from multiple header peers or wording", () => {
+    const doc = page('<a href="/sarah/">Sarah</a><a href="/alex/">Alex</a>', "");
     expect(classifyThread(doc).kind).toBe("group");
-    expect(parseCurrentThread(doc, location)).toEqual([]);
-  });
-  it("rejects own messages", () => {
-    const doc = page('<a href="/sarah/">Sarah</a>', '<div data-message-id="m2" aria-label="You sent: hello">hello</div>');
-    expect(parseCurrentThread(doc, location)).toEqual([]);
-  });
-  it("ignores unrelated Instagram notifications", () => {
-    document.body.innerHTML = '<main><div role="listitem" aria-label="Alex liked your photo">Alex liked your photo</div></main>';
-    expect(parseCurrentThread(document, { pathname: "/accounts/activity/", href: "https://www.instagram.com/accounts/activity/" } as Location)).toEqual([]);
-  });
-  it("creates the same fallback key when the DOM rerenders", () => {
-    const markup = '<div role="row" aria-label="Received from Sarah: stable text"><time datetime="2026-08-13T10:00:00Z"></time>stable text</div>';
-    expect(parseCurrentThread(page('<a href="/sarah/">Sarah</a>', markup), location)[0].messageKey)
-      .toBe(parseCurrentThread(page('<a href="/sarah/">Sarah</a>', markup), location)[0].messageKey);
   });
   it("fails closed when the header cannot prove a single peer", () => {
-    const doc = page("<span>Conversation details unavailable</span>", '<div data-message-id="m3" aria-label="Received: uncertain">uncertain</div>');
+    const doc = page("<span>Conversation details unavailable</span>", "");
     expect(classifyThread(doc).kind).toBe("unknown");
-    expect(parseCurrentThread(doc, location)).toEqual([]);
+  });
+});
+
+describe("inbox list parser", () => {
+  function inboxPage(rowsHtml: string): Document {
+    document.body.innerHTML = `<main>${rowsHtml}</main>`;
+    return document;
+  }
+
+  it("extracts a private conversation candidate with sender and preview", () => {
+    const doc = inboxPage('<a href="/direct/t/123/"><span>Sarah</span> bro look at this<img src="/a.jpg"></a>');
+    const [item] = parseInboxList(doc);
+    expect(item).toMatchObject({ conversationId: "123", sender: "Sarah", preview: "bro look at this", kind: "private" });
+  });
+
+  it("classifies a group thread from its stacked avatars", () => {
+    const doc = inboxPage('<a href="/direct/t/456/"><span>Weekend Trip</span> Alex: see you there<img src="/a.jpg"><img src="/b.jpg"></a>');
+    const [item] = parseInboxList(doc);
+    expect(item.kind).toBe("group");
+  });
+
+  it("classifies a group thread from group wording even with one avatar rendered", () => {
+    const doc = inboxPage('<a href="/direct/t/789/" aria-label="Group chat"><span>Study Group</span> hey all<img src="/a.jpg"></a>');
+    expect(inboxRowKind(doc.querySelector("a")!)).toBe("group");
+  });
+
+  it("excludes rows whose last message is the user's own", () => {
+    const doc = inboxPage('<a href="/direct/t/123/"><span>Sarah</span> You: on my way<img src="/a.jpg"></a>');
+    expect(parseInboxList(doc)).toEqual([]);
+  });
+
+  it("produces a stable message key for unchanged previews across rerenders", () => {
+    const markup = '<a href="/direct/t/123/"><span>Sarah</span> stable text<img src="/a.jpg"></a>';
+    expect(parseInboxList(inboxPage(markup))[0].messageKey).toBe(parseInboxList(inboxPage(markup))[0].messageKey);
   });
 });
 
 describe("content controls", () => {
   const controls = {
     disableHomeFeed: true, disableReels: true, disableExplore: true, disableSearch: true,
-    disablePosts: true, disableStories: true, disableSuggestions: true, ghostStories: false
+    disablePosts: true, disableStories: true, disableSuggestions: true, ghostStories: false,
+    hidePrivateChats: false, hideGroupChats: false
   };
   it("blocks selected distraction routes", () => {
     expect(blockedDestination("/", controls)).toBe(true);
@@ -78,6 +97,21 @@ describe("content controls", () => {
     expect(document.querySelector<HTMLElement>("#suggestions")!.style.display).toBe("none");
     expect(document.querySelector<HTMLElement>("#feed")!.style.marginLeft).toBe("auto");
   });
+  it("hides private inbox rows while leaving group rows visible", async () => {
+    document.body.innerHTML = `<main>
+      <a id="private" href="/direct/t/123/"><span>Sarah</span>Sarah hey<img src="/a.jpg"></a>
+      <a id="group" href="/direct/t/456/"><span>Trip</span>Trip see you<img src="/a.jpg"><img src="/b.jpg"></a>
+    </main>`;
+    const hideControls = { ...controls, hidePrivateChats: true, hideGroupChats: false };
+    window.__INSTADESK_CONTENT_CONTROLS__ = hideControls;
+    window.__TAURI_INTERNALS__ = { invoke: async () => hideControls };
+    delete window.__INSTADESK_CONTROLS__;
+    installContentControls(window);
+    await Promise.resolve();
+
+    expect(document.querySelector<HTMLElement>("#private")!.style.display).toBe("none");
+    expect(document.querySelector<HTMLElement>("#group")!.style.display).not.toBe("none");
+  });
 });
 
 describe("navigation shortcuts", () => {
@@ -93,7 +127,7 @@ describe("navigation shortcuts", () => {
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "F11", cancelable: true }));
     await Promise.resolve();
 
-    expect(actions).toEqual(["fullscreen"]);
+    expect(actions).toEqual(["hide_if_open", "hide_if_open", "fullscreen"]);
     expect(reachedPageHandler).toBe(true);
   });
 });

@@ -6,15 +6,6 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 
-export interface DmCandidate {
-  conversationId: string;
-  conversationUrl: string;
-  sender: string;
-  preview: string;
-  messageKey: string;
-  receivedAt: number;
-}
-
 export interface ContentControls {
   disableHomeFeed: boolean;
   disableReels: boolean;
@@ -24,6 +15,8 @@ export interface ContentControls {
   disableStories: boolean;
   disableSuggestions: boolean;
   ghostStories: boolean;
+  hidePrivateChats: boolean;
+  hideGroupChats: boolean;
 }
 
 const DEFAULT_CONTROLS: ContentControls = {
@@ -34,13 +27,14 @@ const DEFAULT_CONTROLS: ContentControls = {
   disablePosts: false,
   disableStories: false,
   disableSuggestions: false,
-  ghostStories: false
+  ghostStories: false,
+  hidePrivateChats: false,
+  hideGroupChats: false
 };
 
 const THREAD_RE = /^\/direct\/t\/([^/?#]+)\/?/;
 const GROUP_WORDS = /\b(group|members?|participants?|people)\b/i;
 const OWN_WORDS = /\b(you sent|sent by you|your message)\b/i;
-const RECEIVED_WORDS = /\b(received|sent by|message from)\b/i;
 const PROFILE_RE = /^\/(?!direct(?:\/|$)|explore(?:\/|$)|reels?(?:\/|$)|accounts(?:\/|$)|p(?:\/|$))([A-Za-z0-9._]+)\/?$/;
 
 function normalizedText(node: Element | null): string {
@@ -93,61 +87,71 @@ export function classifyThread(document: Document): { kind: "private"; peer: str
   return { kind: "private", peer: [...peers.values()][0] };
 }
 
-function messageRows(document: Document): Element[] {
-  const main = document.querySelector("main") ?? document.body;
-  const selectors = [
-    '[data-message-id]',
-    '[role="row"][aria-label]',
-    '[role="listitem"][aria-label]',
-    'div[aria-label*="message" i]',
-    'div[aria-label*="sent" i]',
-    'div[aria-label*="received" i]'
-  ];
-  return [...new Set(selectors.flatMap((selector) => [...main.querySelectorAll(selector)]))];
+export interface InboxCandidate {
+  conversationId: string;
+  conversationUrl: string;
+  sender: string;
+  preview: string;
+  messageKey: string;
+  kind: "private" | "group" | "unknown";
 }
 
-function isIncoming(row: Element, peer: string): boolean {
-  const label = `${row.getAttribute("aria-label") ?? ""} ${row.getAttribute("data-testid") ?? ""}`;
-  if (OWN_WORDS.test(label)) return false;
-  if (RECEIVED_WORDS.test(label) || label.toLowerCase().includes(peer.toLowerCase())) return true;
-  // Current Instagram rows generally align outgoing bubbles at the end/right.
-  // Alignment is supporting evidence only; absence stays unknown (false).
-  const style = row.getAttribute("style") ?? "";
-  return /justify-content:\s*flex-start|align-items:\s*flex-start/i.test(style);
+/** A row's own last-sent message is prefixed "You: ..." or carries the same wording as an open thread's own bubbles. */
+function isOwnLastMessage(row: Element, preview: string): boolean {
+  const text = `${row.getAttribute("aria-label") ?? ""} ${normalizedText(row)}`;
+  return OWN_WORDS.test(text) || /^you\s*:/i.test(preview);
 }
 
-function previewFor(row: Element): string {
-  const labelled = row.getAttribute("aria-label")?.replace(/^(received|message from|sent by)\s*[^:]*:\s*/i, "").trim();
-  const text = labelled || normalizedText(row);
-  return text.slice(0, 240);
+/** Group threads show a stacked cluster of 2+ avatars; 1:1 threads show exactly one. */
+export function inboxRowKind(row: Element): "private" | "group" | "unknown" {
+  const text = `${row.getAttribute("aria-label") ?? ""} ${normalizedText(row)}`;
+  if (GROUP_WORDS.test(text)) return "group";
+  const avatars = row.querySelectorAll("img").length;
+  if (avatars >= 2) return "group";
+  if (avatars === 1) return "private";
+  return "unknown";
 }
 
-export function parseCurrentThread(document: Document, location: Pick<Location, "pathname" | "href">, now = Date.now()): DmCandidate[] {
-  const conversationId = threadIdFromPath(location.pathname);
-  if (!conversationId) return [];
-  const classification = classifyThread(document);
-  if (classification.kind !== "private") return [];
+function inboxRowTitle(row: Element): string {
+  const nameSpan = row.querySelector<HTMLElement>("span");
+  const name = nameSpan ? normalizedText(nameSpan) : "";
+  return name || (row.getAttribute("aria-label") ?? "").split(",")[0].trim() || "Instagram";
+}
 
-  return messageRows(document).flatMap((row) => {
-    if (!isIncoming(row, classification.peer)) return [];
-    const preview = previewFor(row);
-    if (!preview) return [];
-    const explicitId = row.getAttribute("data-message-id") || row.getAttribute("data-testid");
-    const time = row.querySelector("time")?.getAttribute("datetime") || "";
+function inboxRowPreview(row: Element): string {
+  const text = normalizedText(row);
+  const title = inboxRowTitle(row);
+  const rest = title && text.startsWith(title) ? text.slice(title.length) : text;
+  return rest.replace(/^[\s·:,-]+/, "").slice(0, 240);
+}
+
+/**
+ * Scans Instagram's own inbox conversation list, not the open thread, so new
+ * messages are found regardless of which page (or which thread) is on screen.
+ * Own last-sent messages are excluded; everything else is a notification candidate.
+ */
+export function parseInboxList(document: Document, origin = "https://www.instagram.com"): InboxCandidate[] {
+  const rows = [...document.querySelectorAll<HTMLAnchorElement>('a[href^="/direct/t/"]')];
+  return rows.flatMap((row) => {
+    const conversationId = threadIdFromPath(row.getAttribute("href") ?? "");
+    if (!conversationId) return [];
+    const preview = inboxRowPreview(row);
+    if (!preview || isOwnLastMessage(row, preview)) return [];
     return [{
       conversationId,
-      conversationUrl: new URL(location.href).href,
-      sender: classification.peer,
+      conversationUrl: new URL(`/direct/t/${conversationId}/`, origin).href,
+      sender: inboxRowTitle(row),
       preview,
-      messageKey: explicitId || stableHash(`${conversationId}|${classification.peer}|${preview}|${time}`),
-      receivedAt: now
+      messageKey: stableHash(`${conversationId}|${preview}`),
+      kind: inboxRowKind(row)
     }];
   });
 }
 
 declare global {
   interface Window {
-    __INSTADESK_MONITOR__?: boolean;
+    __INSTADESK_ROLE__?: "main" | "inbox";
+    __INSTADESK_INBOX_MONITOR__?: boolean;
     __INSTADESK_SHORTCUTS__?: boolean;
     __INSTADESK_CONTROLS__?: boolean;
     __INSTADESK_MEDIA_ACTIONS__?: boolean;
@@ -186,15 +190,24 @@ function nativeAction(win: Window, action: string): void {
   void win.__TAURI_INTERNALS__?.invoke("window_action", { action }).catch((error) => console.warn("[InstaDesk] window action failed", error));
 }
 
-/** Keeps F11 owned by the shell before Instagram handles the key event. */
+/**
+ * Keeps F11 owned by the shell before Instagram handles the key event, and
+ * hides the window on Alt+Left/Right on top of the WebView's own built-in
+ * back/forward handling for those keys (left untouched here).
+ */
 export function installNavigationShortcuts(win: Window): void {
   if (win.__INSTADESK_SHORTCUTS__) return;
   win.__INSTADESK_SHORTCUTS__ = true;
   win.addEventListener("keydown", (event) => {
-    if (event.key !== "F11") return;
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    nativeAction(win, "fullscreen");
+    if (event.key === "F11") {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      nativeAction(win, "fullscreen");
+      return;
+    }
+    if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+      nativeAction(win, "hide_if_open");
+    }
   }, true);
 }
 
@@ -270,6 +283,15 @@ export function installContentControls(win: Window): void {
         }
       }
     }
+
+    if (controls.hidePrivateChats || controls.hideGroupChats) {
+      for (const row of main.querySelectorAll<HTMLAnchorElement>('a[href^="/direct/t/"]')) {
+        const kind = inboxRowKind(row);
+        if ((kind === "private" && controls.hidePrivateChats) || (kind === "group" && controls.hideGroupChats)) {
+          hide(enclosingBlock(row, main));
+        }
+      }
+    }
   };
   const apply = () => {
     if (!win.document?.documentElement) return;
@@ -288,6 +310,17 @@ export function installContentControls(win: Window): void {
       redirecting = true;
       console.debug("[InstaDesk] blocked page redirected to DMs", { pathname });
       win.location.replace("/direct/inbox/");
+      return;
+    }
+    if (!redirecting && threadIdFromPath(pathname) && (controls.hidePrivateChats || controls.hideGroupChats)) {
+      const classification = classifyThread(win.document);
+      const hidden = (classification.kind === "private" && controls.hidePrivateChats)
+        || (classification.kind === "group" && controls.hideGroupChats);
+      if (hidden) {
+        redirecting = true;
+        console.debug("[InstaDesk] hidden conversation redirected to DMs", { pathname });
+        win.location.replace("/direct/inbox/");
+      }
     }
   };
   const refresh = async () => {
@@ -669,59 +702,62 @@ export function installStoryMediaActions(win: Window): void {
   enhance();
 }
 
-export function installMonitor(win: Window): void {
-  if (win.__INSTADESK_MONITOR__) return;
-  win.__INSTADESK_MONITOR__ = true;
-  const seen = new Set<string>();
+/**
+ * Runs in a dedicated background WebView pinned to the inbox list, independent
+ * of whatever page or thread the visible WebView shows and independent of the
+ * window being minimized/hidden, so a new message is caught no matter what the
+ * user is looking at. Detection is a diff against each conversation's last seen
+ * message key rather than an "unread" flag, since Instagram's unread styling is
+ * not a stable selector to depend on.
+ */
+export function installInboxMonitor(win: Window): void {
+  if (win.__INSTADESK_INBOX_MONITOR__) return;
+  win.__INSTADESK_INBOX_MONITOR__ = true;
+  const seen = new Map<string, string>();
   let primed = false;
-  let activeConversation: string | null = null;
   let timer: number | undefined;
 
   const scan = () => {
     timer = undefined;
     try {
-      const conversation = threadIdFromPath(win.location.pathname);
-      if (conversation !== activeConversation) {
-        activeConversation = conversation;
-        primed = false;
-        seen.clear();
-        console.debug("[InstaDesk] conversation changed; resetting baseline", { conversation });
-      }
-      const candidates = parseCurrentThread(win.document, win.location);
+      const candidates = parseInboxList(win.document);
       if (!primed) {
-        candidates.forEach((item) => seen.add(`${item.conversationId}:${item.messageKey}`));
+        for (const item of candidates) seen.set(item.conversationId, item.messageKey);
         primed = true;
-        console.debug(`[InstaDesk] monitor primed with ${seen.size} existing incoming messages`);
+        console.debug(`[InstaDesk] inbox monitor primed with ${seen.size} conversations`);
         return;
       }
       for (const item of candidates) {
-        const key = `${item.conversationId}:${item.messageKey}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        console.debug("[InstaDesk] incoming private DM detected", { conversationId: item.conversationId, sender: item.sender });
-        void win.__TAURI_INTERNALS__?.invoke("incoming_private_dm", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
+        if (seen.get(item.conversationId) === item.messageKey) continue;
+        seen.set(item.conversationId, item.messageKey);
+        console.debug("[InstaDesk] incoming message detected", { conversationId: item.conversationId, kind: item.kind });
+        void win.__TAURI_INTERNALS__?.invoke("incoming_message", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
       }
-      if (seen.size > 1000) [...seen].slice(0, 250).forEach((key) => seen.delete(key));
-    } catch (error) { console.warn("[InstaDesk] parsing failure", error); }
+    } catch (error) { console.warn("[InstaDesk] inbox parsing failure", error); }
   };
-  const schedule = () => { if (timer === undefined) timer = win.setTimeout(scan, 350); };
-  new MutationObserver(schedule).observe(win.document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["aria-label", "data-message-id"] });
-  win.addEventListener("popstate", schedule);
-  win.addEventListener("hashchange", schedule);
+  const schedule = () => { if (timer === undefined) timer = win.setTimeout(scan, 700); };
+  new MutationObserver(schedule).observe(win.document.documentElement, { childList: true, subtree: true, characterData: true });
+  // Instagram can update the list via a websocket push the observer alone may miss; poll as a backstop.
+  win.setInterval(schedule, 5000);
   schedule();
-  console.debug("[InstaDesk] DM observer installed");
+  console.debug("[InstaDesk] inbox observer installed");
 }
 
 if (typeof window !== "undefined" && location.hostname.endsWith("instagram.com")) {
   installRemoteIpcFallback(window);
-  installNavigationShortcuts(window);
-  const installPageFeatures = () => {
-    installContentControls(window);
-    installGhostStories(window);
-    installPostMediaActions(window);
-    installStoryMediaActions(window);
-    installMonitor(window);
-  };
-  if (document.body) installPageFeatures();
-  else document.addEventListener("DOMContentLoaded", installPageFeatures, { once: true });
+  if (window.__INSTADESK_ROLE__ === "inbox") {
+    const start = () => installInboxMonitor(window);
+    if (document.body) start();
+    else document.addEventListener("DOMContentLoaded", start, { once: true });
+  } else {
+    installNavigationShortcuts(window);
+    const installPageFeatures = () => {
+      installContentControls(window);
+      installGhostStories(window);
+      installPostMediaActions(window);
+      installStoryMediaActions(window);
+    };
+    if (document.body) installPageFeatures();
+    else document.addEventListener("DOMContentLoaded", installPageFeatures, { once: true });
+  }
 }

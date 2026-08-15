@@ -89,12 +89,13 @@
     disablePosts: false,
     disableStories: false,
     disableSuggestions: false,
-    ghostStories: false
+    ghostStories: false,
+    hidePrivateChats: false,
+    hideGroupChats: false
   };
   var THREAD_RE = /^\/direct\/t\/([^/?#]+)\/?/;
   var GROUP_WORDS = /\b(group|members?|participants?|people)\b/i;
   var OWN_WORDS = /\b(you sent|sent by you|your message)\b/i;
-  var RECEIVED_WORDS = /\b(received|sent by|message from)\b/i;
   var PROFILE_RE = /^\/(?!direct(?:\/|$)|explore(?:\/|$)|reels?(?:\/|$)|accounts(?:\/|$)|p(?:\/|$))([A-Za-z0-9._]+)\/?$/;
   function normalizedText(node) {
     return (node?.textContent ?? "").replace(/\s+/g, " ").trim();
@@ -141,48 +142,43 @@
     if (peers.size !== 1) return { kind: peers.size > 1 ? "group" : "unknown" };
     return { kind: "private", peer: [...peers.values()][0] };
   }
-  function messageRows(document2) {
-    const main = document2.querySelector("main") ?? document2.body;
-    const selectors = [
-      "[data-message-id]",
-      '[role="row"][aria-label]',
-      '[role="listitem"][aria-label]',
-      'div[aria-label*="message" i]',
-      'div[aria-label*="sent" i]',
-      'div[aria-label*="received" i]'
-    ];
-    return [...new Set(selectors.flatMap((selector) => [...main.querySelectorAll(selector)]))];
+  function isOwnLastMessage(row, preview) {
+    const text = `${row.getAttribute("aria-label") ?? ""} ${normalizedText(row)}`;
+    return OWN_WORDS.test(text) || /^you\s*:/i.test(preview);
   }
-  function isIncoming(row, peer) {
-    const label = `${row.getAttribute("aria-label") ?? ""} ${row.getAttribute("data-testid") ?? ""}`;
-    if (OWN_WORDS.test(label)) return false;
-    if (RECEIVED_WORDS.test(label) || label.toLowerCase().includes(peer.toLowerCase())) return true;
-    const style = row.getAttribute("style") ?? "";
-    return /justify-content:\s*flex-start|align-items:\s*flex-start/i.test(style);
+  function inboxRowKind(row) {
+    const text = `${row.getAttribute("aria-label") ?? ""} ${normalizedText(row)}`;
+    if (GROUP_WORDS.test(text)) return "group";
+    const avatars = row.querySelectorAll("img").length;
+    if (avatars >= 2) return "group";
+    if (avatars === 1) return "private";
+    return "unknown";
   }
-  function previewFor(row) {
-    const labelled = row.getAttribute("aria-label")?.replace(/^(received|message from|sent by)\s*[^:]*:\s*/i, "").trim();
-    const text = labelled || normalizedText(row);
-    return text.slice(0, 240);
+  function inboxRowTitle(row) {
+    const nameSpan = row.querySelector("span");
+    const name = nameSpan ? normalizedText(nameSpan) : "";
+    return name || (row.getAttribute("aria-label") ?? "").split(",")[0].trim() || "Instagram";
   }
-  function parseCurrentThread(document2, location2, now = Date.now()) {
-    const conversationId = threadIdFromPath(location2.pathname);
-    if (!conversationId) return [];
-    const classification = classifyThread(document2);
-    if (classification.kind !== "private") return [];
-    return messageRows(document2).flatMap((row) => {
-      if (!isIncoming(row, classification.peer)) return [];
-      const preview = previewFor(row);
-      if (!preview) return [];
-      const explicitId = row.getAttribute("data-message-id") || row.getAttribute("data-testid");
-      const time = row.querySelector("time")?.getAttribute("datetime") || "";
+  function inboxRowPreview(row) {
+    const text = normalizedText(row);
+    const title = inboxRowTitle(row);
+    const rest = title && text.startsWith(title) ? text.slice(title.length) : text;
+    return rest.replace(/^[\s·:,-]+/, "").slice(0, 240);
+  }
+  function parseInboxList(document2, origin = "https://www.instagram.com") {
+    const rows = [...document2.querySelectorAll('a[href^="/direct/t/"]')];
+    return rows.flatMap((row) => {
+      const conversationId = threadIdFromPath(row.getAttribute("href") ?? "");
+      if (!conversationId) return [];
+      const preview = inboxRowPreview(row);
+      if (!preview || isOwnLastMessage(row, preview)) return [];
       return [{
         conversationId,
-        conversationUrl: new URL(location2.href).href,
-        sender: classification.peer,
+        conversationUrl: new URL(`/direct/t/${conversationId}/`, origin).href,
+        sender: inboxRowTitle(row),
         preview,
-        messageKey: explicitId || stableHash(`${conversationId}|${classification.peer}|${preview}|${time}`),
-        receivedAt: now
+        messageKey: stableHash(`${conversationId}|${preview}`),
+        kind: inboxRowKind(row)
       }];
     });
   }
@@ -212,10 +208,15 @@
     if (win.__INSTADESK_SHORTCUTS__) return;
     win.__INSTADESK_SHORTCUTS__ = true;
     win.addEventListener("keydown", (event) => {
-      if (event.key !== "F11") return;
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      nativeAction(win, "fullscreen");
+      if (event.key === "F11") {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        nativeAction(win, "fullscreen");
+        return;
+      }
+      if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+        nativeAction(win, "hide_if_open");
+      }
     }, true);
   }
   function installContentControls(win) {
@@ -277,6 +278,14 @@
           }
         }
       }
+      if (controls.hidePrivateChats || controls.hideGroupChats) {
+        for (const row of main.querySelectorAll('a[href^="/direct/t/"]')) {
+          const kind = inboxRowKind(row);
+          if (kind === "private" && controls.hidePrivateChats || kind === "group" && controls.hideGroupChats) {
+            hide(enclosingBlock(row, main));
+          }
+        }
+      }
     };
     const apply = () => {
       if (!win.document?.documentElement) return;
@@ -295,6 +304,16 @@
         redirecting = true;
         console.debug("[InstaDesk] blocked page redirected to DMs", { pathname });
         win.location.replace("/direct/inbox/");
+        return;
+      }
+      if (!redirecting && threadIdFromPath(pathname) && (controls.hidePrivateChats || controls.hideGroupChats)) {
+        const classification = classifyThread(win.document);
+        const hidden = classification.kind === "private" && controls.hidePrivateChats || classification.kind === "group" && controls.hideGroupChats;
+        if (hidden) {
+          redirecting = true;
+          console.debug("[InstaDesk] hidden conversation redirected to DMs", { pathname });
+          win.location.replace("/direct/inbox/");
+        }
       }
     };
     const refresh = async () => {
@@ -634,62 +653,56 @@
     new MutationObserver(enhance).observe(win.document.body, { childList: true, subtree: true });
     enhance();
   }
-  function installMonitor(win) {
-    if (win.__INSTADESK_MONITOR__) return;
-    win.__INSTADESK_MONITOR__ = true;
-    const seen = /* @__PURE__ */ new Set();
+  function installInboxMonitor(win) {
+    if (win.__INSTADESK_INBOX_MONITOR__) return;
+    win.__INSTADESK_INBOX_MONITOR__ = true;
+    const seen = /* @__PURE__ */ new Map();
     let primed = false;
-    let activeConversation = null;
     let timer;
     const scan = () => {
       timer = void 0;
       try {
-        const conversation = threadIdFromPath(win.location.pathname);
-        if (conversation !== activeConversation) {
-          activeConversation = conversation;
-          primed = false;
-          seen.clear();
-          console.debug("[InstaDesk] conversation changed; resetting baseline", { conversation });
-        }
-        const candidates = parseCurrentThread(win.document, win.location);
+        const candidates = parseInboxList(win.document);
         if (!primed) {
-          candidates.forEach((item) => seen.add(`${item.conversationId}:${item.messageKey}`));
+          for (const item of candidates) seen.set(item.conversationId, item.messageKey);
           primed = true;
-          console.debug(`[InstaDesk] monitor primed with ${seen.size} existing incoming messages`);
+          console.debug(`[InstaDesk] inbox monitor primed with ${seen.size} conversations`);
           return;
         }
         for (const item of candidates) {
-          const key = `${item.conversationId}:${item.messageKey}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          console.debug("[InstaDesk] incoming private DM detected", { conversationId: item.conversationId, sender: item.sender });
-          void win.__TAURI_INTERNALS__?.invoke("incoming_private_dm", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
+          if (seen.get(item.conversationId) === item.messageKey) continue;
+          seen.set(item.conversationId, item.messageKey);
+          console.debug("[InstaDesk] incoming message detected", { conversationId: item.conversationId, kind: item.kind });
+          void win.__TAURI_INTERNALS__?.invoke("incoming_message", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
         }
-        if (seen.size > 1e3) [...seen].slice(0, 250).forEach((key) => seen.delete(key));
       } catch (error) {
-        console.warn("[InstaDesk] parsing failure", error);
+        console.warn("[InstaDesk] inbox parsing failure", error);
       }
     };
     const schedule = () => {
-      if (timer === void 0) timer = win.setTimeout(scan, 350);
+      if (timer === void 0) timer = win.setTimeout(scan, 700);
     };
-    new MutationObserver(schedule).observe(win.document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["aria-label", "data-message-id"] });
-    win.addEventListener("popstate", schedule);
-    win.addEventListener("hashchange", schedule);
+    new MutationObserver(schedule).observe(win.document.documentElement, { childList: true, subtree: true, characterData: true });
+    win.setInterval(schedule, 5e3);
     schedule();
-    console.debug("[InstaDesk] DM observer installed");
+    console.debug("[InstaDesk] inbox observer installed");
   }
   if (typeof window !== "undefined" && location.hostname.endsWith("instagram.com")) {
     installRemoteIpcFallback(window);
-    installNavigationShortcuts(window);
-    const installPageFeatures = () => {
-      installContentControls(window);
-      installGhostStories(window);
-      installPostMediaActions(window);
-      installStoryMediaActions(window);
-      installMonitor(window);
-    };
-    if (document.body) installPageFeatures();
-    else document.addEventListener("DOMContentLoaded", installPageFeatures, { once: true });
+    if (window.__INSTADESK_ROLE__ === "inbox") {
+      const start = () => installInboxMonitor(window);
+      if (document.body) start();
+      else document.addEventListener("DOMContentLoaded", start, { once: true });
+    } else {
+      installNavigationShortcuts(window);
+      const installPageFeatures = () => {
+        installContentControls(window);
+        installGhostStories(window);
+        installPostMediaActions(window);
+        installStoryMediaActions(window);
+      };
+      if (document.body) installPageFeatures();
+      else document.addEventListener("DOMContentLoaded", installPageFeatures, { once: true });
+    }
   }
 })();
