@@ -49,6 +49,7 @@ struct Settings {
     disable_posts: bool,
     disable_stories: bool,
     disable_suggestions: bool,
+    ghost_stories: bool,
 }
 
 impl Default for Settings {
@@ -65,6 +66,7 @@ impl Default for Settings {
             disable_posts: false,
             disable_stories: false,
             disable_suggestions: false,
+            ghost_stories: false,
         }
     }
 }
