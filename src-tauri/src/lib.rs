@@ -38,7 +38,8 @@ static ALT_TOGGLE_FIRED: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Settings {
-    notifications: bool,
+    notify_private: bool,
+    notify_group: bool,
     launch_at_startup: bool,
     minimize_to_tray: bool,
     notification_previews: bool,
@@ -50,12 +51,15 @@ struct Settings {
     disable_stories: bool,
     disable_suggestions: bool,
     ghost_stories: bool,
+    hide_private_chats: bool,
+    hide_group_chats: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            notifications: true,
+            notify_private: true,
+            notify_group: true,
             launch_at_startup: false,
             minimize_to_tray: true,
             notification_previews: true,
@@ -67,20 +71,21 @@ impl Default for Settings {
             disable_stories: false,
             disable_suggestions: false,
             ghost_stories: false,
+            hide_private_chats: false,
+            hide_group_chats: false,
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DmMessage {
+struct InboxMessage {
     conversation_id: String,
     conversation_url: String,
     sender: String,
     preview: String,
     message_key: String,
-    #[allow(dead_code)]
-    received_at: u64,
+    kind: String,
 }
 
 struct AppState {
@@ -137,6 +142,23 @@ fn show_instagram<R: Runtime>(app: &AppHandle<R>, destination: Option<&str>) {
     let _ = window.set_focus();
 }
 
+fn hide_main_window<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
+    if let Some(settings) = app.get_webview_window("settings") {
+        let _ = settings.hide();
+    }
+    let minimize_to_tray = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .map(|settings| settings.minimize_to_tray)
+        .unwrap_or(true);
+    if minimize_to_tray {
+        let _ = window.hide();
+    } else {
+        let _ = window.minimize();
+    }
+}
+
 fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
     let Some(window) = app.get_window("main") else {
         return;
@@ -144,24 +166,22 @@ fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
     let visible = window.is_visible().unwrap_or(false);
     let minimized = window.is_minimized().unwrap_or(false);
     if visible && !minimized {
-        if let Some(settings) = app.get_webview_window("settings") {
-            let _ = settings.hide();
-        }
-        let minimize_to_tray = app
-            .state::<AppState>()
-            .settings
-            .lock()
-            .map(|settings| settings.minimize_to_tray)
-            .unwrap_or(true);
-        if minimize_to_tray {
-            let _ = window.hide();
-        } else {
-            let _ = window.minimize();
-        }
+        hide_main_window(app, &window);
     } else {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+    }
+}
+
+fn hide_main_window_if_open<R: Runtime>(app: &AppHandle<R>) {
+    let Some(window) = app.get_window("main") else {
+        return;
+    };
+    let visible = window.is_visible().unwrap_or(false);
+    let minimized = window.is_minimized().unwrap_or(false);
+    if visible && !minimized {
+        hide_main_window(app, &window);
     }
 }
 
@@ -267,10 +287,12 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
         .lock()
         .map(|settings| serde_json::to_string(&*settings).unwrap_or_else(|_| "{}".into()))
         .unwrap_or_else(|_| "{}".into());
-    let initialization_script = format!(
-        "window.__INSTADESK_CONTENT_CONTROLS__ = {initial_settings};\n{}",
-        include_str!("../generated/dm-monitor.js")
+    let dm_monitor_js = include_str!("../generated/dm-monitor.js");
+    let instagram_init = format!(
+        "window.__INSTADESK_ROLE__ = 'main';\nwindow.__INSTADESK_CONTENT_CONTROLS__ = {initial_settings};\n{dm_monitor_js}"
     );
+    let inbox_init =
+        format!("window.__INSTADESK_ROLE__ = 'inbox';\n{dm_monitor_js}");
     let window = WindowBuilder::new(app, "main")
         .title("")
         .inner_size(1160.0, 800.0)
@@ -287,10 +309,20 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
     )?;
     window.add_child(
         WebviewBuilder::new("instagram", WebviewUrl::External(url))
-            .initialization_script(initialization_script)
+            .initialization_script(instagram_init)
             .on_navigation(|url| instagram_url(url.as_str()).is_some()),
         PhysicalPosition::new(0, chrome_height as i32),
         PhysicalSize::new(size.width, size.height.saturating_sub(chrome_height)),
+    )?;
+    // Runs off-screen at all times so new messages are caught regardless of
+    // which page is visible, or whether the window is minimized or hidden.
+    let inbox_url = url::Url::parse(INSTAGRAM_INBOX).expect("valid Instagram URL");
+    window.add_child(
+        WebviewBuilder::new("inbox", WebviewUrl::External(inbox_url))
+            .initialization_script(inbox_init)
+            .on_navigation(|url| instagram_url(url.as_str()).is_some()),
+        PhysicalPosition::new(-10_000, -10_000),
+        PhysicalSize::new(1, 1),
     )?;
     let handle = app.clone();
     window.on_window_event(move |event| match event {
@@ -376,15 +408,21 @@ fn dispatch_notification<R: Runtime>(
     sender: &str,
     preview: &str,
     destination: &str,
+    kind: &str,
 ) -> Result<(), String> {
     let destination = instagram_url(destination)
         .map(|u| u.to_string())
         .unwrap_or_else(|| INSTAGRAM_INBOX.to_string());
+    let title = if kind == "group" {
+        format!("Instagram Group — {sender}")
+    } else {
+        format!("Instagram — {sender}")
+    };
     #[cfg(windows)]
     {
         let mut toast = notify_rust::Notification::new();
         toast
-            .summary(&format!("Instagram — {sender}"))
+            .summary(&title)
             .body(preview)
             .app_id("com.instadesk.desktop");
         let handle = toast.show().map_err(|e| e.to_string())?;
@@ -401,16 +439,16 @@ fn dispatch_notification<R: Runtime>(
     #[cfg(not(windows))]
     app.notification()
         .builder()
-        .title(format!("Instagram — {sender}"))
+        .title(title)
         .body(preview)
         .show()
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn incoming_private_dm(app: AppHandle, webview: Webview, message: DmMessage) -> Result<(), String> {
-    if webview.label() != "instagram" {
-        return Err("DM events are accepted only from the Instagram WebView".into());
+fn incoming_message(app: AppHandle, webview: Webview, message: InboxMessage) -> Result<(), String> {
+    if webview.label() != "inbox" {
+        return Err("Inbox events are accepted only from the background inbox WebView".into());
     }
     // Defense in depth: the injected adapter can only send HTTPS Instagram thread URLs.
     let Some(destination) = instagram_url(&message.conversation_url) else {
@@ -420,15 +458,21 @@ fn incoming_private_dm(app: AppHandle, webview: Webview, message: DmMessage) -> 
         || message.sender.trim().is_empty()
         || message.preview.trim().is_empty()
     {
-        return Err("Rejected incomplete DM candidate".into());
+        return Err("Rejected incomplete message candidate".into());
     }
+    let kind = if message.kind == "group" { "group" } else { "private" };
     let state = app.state::<AppState>();
     let settings = state
         .settings
         .lock()
         .map_err(|_| "settings lock poisoned")?
         .clone();
-    if !settings.notifications {
+    let allowed = if kind == "group" {
+        settings.notify_group
+    } else {
+        settings.notify_private
+    };
+    if !allowed {
         return Ok(());
     }
     let key = format!("{}:{}", message.conversation_id, message.message_key);
@@ -438,6 +482,8 @@ fn incoming_private_dm(app: AppHandle, webview: Webview, message: DmMessage) -> 
     }
     let body = if settings.notification_previews {
         message.preview
+    } else if kind == "group" {
+        "New group message".into()
     } else {
         "New private message".into()
     };
@@ -446,9 +492,10 @@ fn incoming_private_dm(app: AppHandle, webview: Webview, message: DmMessage) -> 
         message.sender.trim(),
         body.trim(),
         destination.as_str(),
+        kind,
     )?;
     eprintln!(
-        "[InstaDesk] notification dispatched for private conversation {}",
+        "[InstaDesk] {kind} notification dispatched for conversation {}",
         message.conversation_id
     );
     Ok(())
@@ -757,6 +804,7 @@ fn window_action(app: AppHandle, webview: Webview, action: &str) -> Result<(), S
         ("instagram", "forward") => webview
             .eval("history.forward()")
             .map_err(|e| e.to_string())?,
+        ("instagram", "hide_if_open") => hide_main_window_if_open(&app),
         ("settings", "drag_settings") => window.start_dragging().map_err(|e| e.to_string())?,
         ("settings", "close_settings") => window.hide().map_err(|e| e.to_string())?,
         _ => return Err("Window action is not allowed for this WebView".into()),
@@ -789,16 +837,28 @@ fn toggle_setting<R: Runtime>(app: &AppHandle<R>, field: &str) {
     let state = app.state::<AppState>();
     if let Ok(mut settings) = state.settings.lock() {
         match field {
-            "notifications" => settings.notifications = !settings.notifications,
+            "notifyPrivate" => settings.notify_private = !settings.notify_private,
+            "notifyGroup" => settings.notify_group = !settings.notify_group,
             "previews" => settings.notification_previews = !settings.notification_previews,
             "minimize" => settings.minimize_to_tray = !settings.minimize_to_tray,
             "autostart" => {
                 settings.launch_at_startup = !settings.launch_at_startup;
                 set_autostart(app, settings.launch_at_startup);
             }
+            "hidePrivateChats" => settings.hide_private_chats = !settings.hide_private_chats,
+            "hideGroupChats" => settings.hide_group_chats = !settings.hide_group_chats,
             _ => return,
         }
         save_settings(app, &settings);
+        if matches!(field, "hidePrivateChats" | "hideGroupChats") {
+            if let (Some(instagram), Ok(settings_json)) =
+                (app.get_webview("instagram"), serde_json::to_string(&*settings))
+            {
+                let _ = instagram.eval(format!(
+                    "window.dispatchEvent(new CustomEvent('instadesk:settings-changed', {{ detail: {settings_json} }}))"
+                ));
+            }
+        }
     };
 }
 
@@ -806,12 +866,20 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> tauri::Res
     let open = MenuItem::with_id(app, "open", "Open Instagram", true, None::<&str>)?;
     let dms = MenuItem::with_id(app, "dms", "Open DMs", true, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
-    let notifications = CheckMenuItem::with_id(
+    let notify_private = CheckMenuItem::with_id(
         app,
-        "notifications",
-        "Notifications",
+        "notifyPrivate",
+        "Private message notifications",
         true,
-        settings.notifications,
+        settings.notify_private,
+        None::<&str>,
+    )?;
+    let notify_group = CheckMenuItem::with_id(
+        app,
+        "notifyGroup",
+        "Group message notifications",
+        true,
+        settings.notify_group,
         None::<&str>,
     )?;
     let previews = CheckMenuItem::with_id(
@@ -838,6 +906,22 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> tauri::Res
         settings.launch_at_startup,
         None::<&str>,
     )?;
+    let hide_private = CheckMenuItem::with_id(
+        app,
+        "hidePrivateChats",
+        "Hide private chats",
+        true,
+        settings.hide_private_chats,
+        None::<&str>,
+    )?;
+    let hide_group = CheckMenuItem::with_id(
+        app,
+        "hideGroupChats",
+        "Hide group chats",
+        true,
+        settings.hide_group_chats,
+        None::<&str>,
+    )?;
     let test = MenuItem::with_id(
         app,
         "test",
@@ -855,10 +939,13 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> tauri::Res
             &dms,
             &settings_item,
             &sep1,
-            &notifications,
+            &notify_private,
+            &notify_group,
             &previews,
             &minimize,
             &autostart,
+            &hide_private,
+            &hide_group,
             &test,
             &sep2,
             &quit,
@@ -876,15 +963,15 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> tauri::Res
             "open" => show_instagram(app, None),
             "dms" => show_instagram(app, Some(INSTAGRAM_INBOX)),
             "settings" => show_settings(app),
-            "notifications" | "previews" | "minimize" | "autostart" => {
-                toggle_setting(app, event.id.as_ref())
-            }
+            "notifyPrivate" | "notifyGroup" | "previews" | "minimize" | "autostart"
+            | "hidePrivateChats" | "hideGroupChats" => toggle_setting(app, event.id.as_ref()),
             "test" if cfg!(debug_assertions) => {
                 let _ = dispatch_notification(
                     app,
                     "Test User",
                     "This is a test private message.",
                     INSTAGRAM_INBOX,
+                    "private",
                 );
             }
             "quit" => {
@@ -919,7 +1006,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--hidden"])))
-        .invoke_handler(tauri::generate_handler![incoming_private_dm, get_settings, update_settings, get_content_controls, window_action, settings_ui_ready, download_media, copy_image])
+        .invoke_handler(tauri::generate_handler![incoming_message, get_settings, update_settings, get_content_controls, window_action, settings_ui_ready, download_media, copy_image])
         .setup(|app| {
             let settings = load_settings(app.handle());
             app.manage(AppState { settings: Mutex::new(settings.clone()), dedup: Mutex::new((HashSet::new(), VecDeque::new())), quitting: Mutex::new(false) });
@@ -944,7 +1031,7 @@ pub fn run() {
             }
             #[cfg(debug_assertions)]
             if std::env::args().any(|arg| arg == "--test-notification") {
-                dispatch_notification(app.handle(), "Test User", "This is a test private message.", INSTAGRAM_INBOX)
+                dispatch_notification(app.handle(), "Test User", "This is a test private message.", INSTAGRAM_INBOX, "private")
                     .map_err(std::io::Error::other)?;
                 eprintln!("[InstaDesk] development notification dispatched successfully");
             }

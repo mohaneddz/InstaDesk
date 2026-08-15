@@ -1,6 +1,6 @@
 fn main() {
     let app_manifest = tauri_build::AppManifest::new().commands(&[
-        "incoming_private_dm",
+        "incoming_message",
         "get_settings",
         "update_settings",
         "get_content_controls",

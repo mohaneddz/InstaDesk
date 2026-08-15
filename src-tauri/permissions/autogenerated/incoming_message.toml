@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-incoming-message"
+description = "Enables the incoming_message command without any pre-configured scope."
+commands.allow = ["incoming_message"]
+
+[[permission]]
+identifier = "deny-incoming-message"
+description = "Denies the incoming_message command without any pre-configured scope."
+commands.deny = ["incoming_message"]

@@ -201,10 +201,10 @@
           "markdownDescription": "Enables the get_settings command without any pre-configured scope."
         },
         {
-          "description": "Enables the incoming_private_dm command without any pre-configured scope.",
+          "description": "Enables the incoming_message command without any pre-configured scope.",
           "type": "string",
-          "const": "allow-incoming-private-dm",
-          "markdownDescription": "Enables the incoming_private_dm command without any pre-configured scope."
+          "const": "allow-incoming-message",
+          "markdownDescription": "Enables the incoming_message command without any pre-configured scope."
         },
         {
           "description": "Enables the settings_ui_ready command without any pre-configured scope.",
@@ -249,10 +249,10 @@
           "markdownDescription": "Denies the get_settings command without any pre-configured scope."
         },
         {
-          "description": "Denies the incoming_private_dm command without any pre-configured scope.",
+          "description": "Denies the incoming_message command without any pre-configured scope.",
           "type": "string",
-          "const": "deny-incoming-private-dm",
-          "markdownDescription": "Denies the incoming_private_dm command without any pre-configured scope."
+          "const": "deny-incoming-message",
+          "markdownDescription": "Denies the incoming_message command without any pre-configured scope."
         },
         {
           "description": "Denies the settings_ui_ready command without any pre-configured scope.",
