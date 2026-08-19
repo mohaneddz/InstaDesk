@@ -20,6 +20,14 @@ describe("Instagram thread classifier", () => {
     const doc = page('<a href="/sarah/">Sarah</a><a href="/alex/">Alex</a>', "");
     expect(classifyThread(doc).kind).toBe("group");
   });
+  it("classifies groups from details button in thread header", () => {
+    const doc = page('<div><span>Project X</span><a href="/direct/t/123/details/">Details</a></div>', "");
+    expect(classifyThread(doc).kind).toBe("group");
+  });
+  it("classifies groups from comma-separated names in thread header title", () => {
+    const doc = page('<div><span>Alice, Bob, Charlie</span></div>', "");
+    expect(classifyThread(doc).kind).toBe("group");
+  });
   it("fails closed when the header cannot prove a single peer", () => {
     const doc = page("<span>Conversation details unavailable</span>", "");
     expect(classifyThread(doc).kind).toBe("unknown");
@@ -38,6 +46,57 @@ describe("inbox list parser", () => {
     expect(item).toMatchObject({ conversationId: "123", sender: "Sarah", preview: "bro look at this", kind: "private" });
   });
 
+  it("extracts candidates from absolute instagram conversation URLs", () => {
+    const doc = inboxPage('<a href="https://www.instagram.com/direct/t/999/"><span>Mike</span> test message<img src="/a.jpg"></a>');
+    const [item] = parseInboxList(doc);
+    expect(item).toMatchObject({ conversationId: "999", sender: "Mike", preview: "test message", kind: "private" });
+  });
+
+  it("parses rows that carry no thread anchor", () => {
+    const doc = inboxPage(`<div role="list">
+      <div role="listitem"><img alt="Sarah's profile picture" src="/a.jpg"><div><span>Sarah</span></div><div><span>bro look at this</span></div></div>
+    </div>`);
+    const [item] = parseInboxList(doc);
+    expect(item).toMatchObject({ sender: "Sarah", preview: "bro look at this", kind: "private" });
+    expect(item.conversationUrl).toBe("https://www.instagram.com/direct/inbox/");
+  });
+
+  it("classifies a group thread from comma-separated usernames in row title", () => {
+    const doc = inboxPage('<a href="/direct/t/888/"><span>Alice, Bob</span> Hey guys<img src="/a.jpg"></a>');
+    const [item] = parseInboxList(doc);
+    expect(item.kind).toBe("group");
+  });
+
+  it("correctly parses real-world Instagram row with avatar alt and timestamp", () => {
+    const html = `<a href="/direct/t/17841401234567890/">
+      <div>
+        <img alt="ProbablyHim's profile picture" src="/avatar.jpg" />
+        <div>
+          <div><span>ProbablyHim</span></div>
+          <div><span><span>Hi</span><span> · </span><span>1m</span></span></div>
+        </div>
+      </div>
+    </a>`;
+    const doc = inboxPage(html);
+    const [item] = parseInboxList(doc);
+    expect(item).toMatchObject({
+      conversationId: "17841401234567890",
+      sender: "ProbablyHim",
+      preview: "Hi",
+      kind: "private"
+    });
+  });
+
+  it("strips relative timestamps and produces stable message key across timestamp updates", () => {
+    const html1 = `<a href="/direct/t/123/"><div><img alt="Alex's profile picture" src="/a.jpg"/><span>Alex</span><span>Hello world · 1m</span></div></a>`;
+    const html2 = `<a href="/direct/t/123/"><div><img alt="Alex's profile picture" src="/a.jpg"/><span>Alex</span><span>Hello world · 5m</span></div></a>`;
+    const [item1] = parseInboxList(inboxPage(html1));
+    const [item2] = parseInboxList(inboxPage(html2));
+    expect(item1.preview).toBe("Hello world");
+    expect(item2.preview).toBe("Hello world");
+    expect(item1.messageKey).toBe(item2.messageKey);
+  });
+
   it("classifies a group thread from its stacked avatars", () => {
     const doc = inboxPage('<a href="/direct/t/456/"><span>Weekend Trip</span> Alex: see you there<img src="/a.jpg"><img src="/b.jpg"></a>');
     const [item] = parseInboxList(doc);
@@ -51,6 +110,11 @@ describe("inbox list parser", () => {
 
   it("excludes rows whose last message is the user's own", () => {
     const doc = inboxPage('<a href="/direct/t/123/"><span>Sarah</span> You: on my way<img src="/a.jpg"></a>');
+    expect(parseInboxList(doc)).toEqual([]);
+  });
+
+  it("excludes rows with You sent a message format", () => {
+    const doc = inboxPage('<a href="/direct/t/123/"><span>Sarah</span> You sent a photo · 2m<img src="/a.jpg"></a>');
     expect(parseInboxList(doc)).toEqual([]);
   });
 
@@ -112,23 +176,83 @@ describe("content controls", () => {
     expect(document.querySelector<HTMLElement>("#private")!.style.display).toBe("none");
     expect(document.querySelector<HTMLElement>("#group")!.style.display).not.toBe("none");
   });
+  it("hides group inbox rows while leaving private rows visible", async () => {
+    document.body.innerHTML = `<main>
+      <a id="private" href="/direct/t/123/"><span>Sarah</span>Sarah hey<img src="/a.jpg"></a>
+      <a id="group" href="/direct/t/456/"><span>Alice, Bob</span>Alice, Bob see you<img src="/a.jpg"></a>
+    </main>`;
+    const hideControls = { ...controls, hidePrivateChats: false, hideGroupChats: true };
+    window.__INSTADESK_CONTENT_CONTROLS__ = hideControls;
+    window.__TAURI_INTERNALS__ = { invoke: async () => hideControls };
+    delete window.__INSTADESK_CONTROLS__;
+    installContentControls(window);
+    await Promise.resolve();
+
+    expect(document.querySelector<HTMLElement>("#private")!.style.display).not.toBe("none");
+    expect(document.querySelector<HTMLElement>("#group")!.style.display).toBe("none");
+  });
+  it("removes anchor-less rows and Instagram's unread badge", async () => {
+    document.body.innerHTML = `<nav><a href="/direct/inbox/"><span><span>2</span></span></a></nav>
+    <main><div role="list">
+      <div role="listitem" id="row"><img alt="Sarah's profile picture" src="/a.jpg"><span>Sarah</span><span>hey</span></div>
+    </div></main>`;
+    const hideControls = { ...controls, hidePrivateChats: true, hideGroupChats: true };
+    window.__INSTADESK_CONTENT_CONTROLS__ = hideControls;
+    window.__TAURI_INTERNALS__ = { invoke: async () => hideControls };
+    delete window.__INSTADESK_CONTROLS__;
+    installContentControls(window);
+    await Promise.resolve();
+
+    expect(document.querySelector<HTMLElement>("#row")!.style.display).toBe("none");
+    expect(document.querySelector<HTMLElement>("nav a span")!.style.display).toBe("none");
+    expect(document.querySelector<HTMLElement>('[role="list"]')!.style.display).not.toBe("none");
+  });
+  it("prevents clicking on hidden conversation links", async () => {
+    document.body.innerHTML = `<main>
+      <a id="hidden-link" href="/direct/t/777/"><span>Sarah</span><span>Sarah: hey</span><img src="/a.jpg"></a>
+    </main>`;
+    const hideControls = { ...controls, hidePrivateChats: true, hideGroupChats: false };
+    window.__INSTADESK_CONTENT_CONTROLS__ = hideControls;
+    window.__TAURI_INTERNALS__ = { invoke: async () => hideControls };
+    delete window.__INSTADESK_CONTROLS__;
+    installContentControls(window);
+    await Promise.resolve();
+
+    const link = document.querySelector<HTMLAnchorElement>("#hidden-link")!;
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    const notCanceled = link.dispatchEvent(event);
+    expect(notCanceled).toBe(false);
+  });
+  it("classifies custom group name with single avatar as group when preview has sender prefix", () => {
+    const doc = document.createElement("div");
+    doc.innerHTML = '<a href="/direct/t/555/"><span>Gaming Lounge</span><span>Alex: let\'s play</span><img src="/a.jpg"></a>';
+    expect(inboxRowKind(doc.firstElementChild!)).toBe("group");
+  });
+  it("preserves comma-separated group title and extracts correct preview", () => {
+    const doc = document.createElement("div");
+    doc.innerHTML = '<a href="/direct/t/666/"><span>Alice, Bob, Charlie</span><span>Hey all · 2m</span><img src="/a.jpg"><img src="/b.jpg"></a>';
+    const [item] = parseInboxList(doc as unknown as Document);
+    expect(item.sender).toBe("Alice, Bob, Charlie");
+    expect(item.preview).toBe("Hey all");
+    expect(item.kind).toBe("group");
+  });
 });
 
 describe("navigation shortcuts", () => {
-  it("captures app shortcuts before page handlers", async () => {
+  it("captures F11 before page handlers and leaves the Alt chord to the native hook", async () => {
     const actions: string[] = [];
     window.__TAURI_INTERNALS__ = { invoke: async (_command, args) => { actions.push((args as { action: string }).action); } };
+    delete window.__INSTADESK_SHORTCUTS__;
     installNavigationShortcuts(window);
     let reachedPageHandler = false;
     window.addEventListener("keydown", () => { reachedPageHandler = true; });
 
-    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", altKey: true, cancelable: true }));
-    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", altKey: true, cancelable: true }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { code: "AltLeft", cancelable: true }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { code: "AltRight", cancelable: true }));
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "F11", cancelable: true }));
     await Promise.resolve();
 
-    expect(actions).toEqual(["hide_if_open", "hide_if_open", "fullscreen"]);
-    expect(reachedPageHandler).toBe(true);
+    expect(actions).toEqual(["fullscreen"]);
   });
 });
 

@@ -229,16 +229,32 @@
     const fullText = normalizedText(row);
     return OWN_WORDS.test(preview) || OWN_WORDS.test(ariaLabel) || /^\s*you\s*:/i.test(fullText) || /^\s*you\s+sent\b/i.test(fullText);
   }
+  function rowThreadId(row) {
+    const href = row.getAttribute("href") ?? row.querySelector('a[href*="/direct/t/"]')?.getAttribute("href") ?? row.closest('a[href*="/direct/t/"]')?.getAttribute("href");
+    return href ? threadIdFromPath(href) : null;
+  }
+  function rowConversationId(row) {
+    const threadId = rowThreadId(row);
+    if (threadId) return threadId;
+    const title = inboxRowTitle(row);
+    return title && title !== "Instagram" ? `title-${stableHash(title)}` : null;
+  }
+  function inboxRowElements(document2) {
+    const anchors = [...document2.querySelectorAll('a[href*="/direct/t/"]')];
+    if (anchors.length) return anchors;
+    const candidates = [...document2.querySelectorAll('[role="listitem"], [role="row"], [role="button"][tabindex="0"]')].filter((element) => Boolean(element.querySelector("img")) && normalizedText(element).length > 1);
+    return candidates.filter((element) => !candidates.some((other) => other !== element && element.contains(other)));
+  }
   function parseInboxList(document2, origin = "https://www.instagram.com") {
-    const rows = [...document2.querySelectorAll('a[href*="/direct/t/"]')];
-    return rows.flatMap((row) => {
-      const conversationId = threadIdFromPath(row.getAttribute("href") ?? "");
+    return inboxRowElements(document2).flatMap((row) => {
+      const conversationId = rowConversationId(row);
       if (!conversationId) return [];
       const preview = inboxRowPreview(row);
       if (!preview || isOwnLastMessage(row, preview)) return [];
+      const threadId = rowThreadId(row);
       return [{
         conversationId,
-        conversationUrl: new URL(`/direct/t/${conversationId}/`, origin).href,
+        conversationUrl: new URL(threadId ? `/direct/t/${threadId}/` : "/direct/inbox/", origin).href,
         sender: inboxRowTitle(row),
         preview,
         messageKey: stableHash(`${conversationId}|${preview}`),
@@ -271,33 +287,11 @@
   function installNavigationShortcuts(win) {
     if (win.__INSTADESK_SHORTCUTS__) return;
     win.__INSTADESK_SHORTCUTS__ = true;
-    let leftAlt = false;
-    let rightAlt = false;
-    let toggleFired = false;
     win.addEventListener("keydown", (event) => {
       if (event.key === "F11") {
         event.preventDefault();
         event.stopImmediatePropagation();
         nativeAction(win, "fullscreen");
-        return;
-      }
-      if (event.code === "AltLeft") leftAlt = true;
-      if (event.code === "AltRight") rightAlt = true;
-      if (leftAlt && rightAlt && !toggleFired) {
-        toggleFired = true;
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        nativeAction(win, "toggle_window");
-      }
-    }, true);
-    win.addEventListener("keyup", (event) => {
-      if (event.code === "AltLeft") {
-        leftAlt = false;
-        toggleFired = false;
-      }
-      if (event.code === "AltRight") {
-        rightAlt = false;
-        toggleFired = false;
       }
     }, true);
   }
@@ -337,11 +331,13 @@
       }
       return block;
     };
+    const rowCount = (element) => element.querySelectorAll('a[href*="/direct/t/"], [role="listitem"], [role="row"]').length;
     const enclosingRowBlock = (row) => {
       let current = row;
       while (current.parentElement && current.parentElement !== win.document.body) {
         const parent = current.parentElement;
-        if (parent.querySelectorAll('a[href*="/direct/t/"]').length > 1) break;
+        if (rowCount(parent) > Math.max(1, rowCount(current))) break;
+        if (parent.getAttribute("role") === "list") break;
         if (parent.tagName === "MAIN" || parent.tagName === "NAV" || parent.getAttribute("role") === "navigation" || parent.getAttribute("role") === "main") break;
         current = parent;
       }
@@ -385,18 +381,11 @@
       }
       if (controls.hidePrivateChats || controls.hideGroupChats) {
         let hidden = 0;
-        const rows = win.document.querySelectorAll('a[href*="/direct/t/"]');
+        const rows = inboxRowElements(win.document);
         for (const row of rows) {
           const kind = inboxRowKind(row);
           if (kind === "private" && controls.hidePrivateChats || kind === "group" && controls.hideGroupChats || controls.hidePrivateChats && controls.hideGroupChats) {
             hide(enclosingRowBlock(row));
-            hidden++;
-          }
-        }
-        if (controls.hidePrivateChats && controls.hideGroupChats && !rows.length) {
-          for (const item of win.document.querySelectorAll('[role="listitem"]')) {
-            if (!item.querySelector("img")) continue;
-            hide(item);
             hidden++;
           }
         }

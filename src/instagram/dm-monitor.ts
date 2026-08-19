@@ -239,21 +239,55 @@ export function isOwnLastMessage(row: Element, preview: string): boolean {
   return OWN_WORDS.test(preview) || OWN_WORDS.test(ariaLabel) || /^\s*you\s*:/i.test(fullText) || /^\s*you\s+sent\b/i.test(fullText);
 }
 
+function rowThreadId(row: Element): string | null {
+  const href = row.getAttribute("href")
+    ?? row.querySelector('a[href*="/direct/t/"]')?.getAttribute("href")
+    ?? row.closest('a[href*="/direct/t/"]')?.getAttribute("href");
+  return href ? threadIdFromPath(href) : null;
+}
+
+/**
+ * Identifies a row even when Instagram renders it without a thread link, which
+ * it does on some builds of the inbox; the title is then the only stable handle,
+ * and it is all the diff against the previous scan actually needs.
+ */
+function rowConversationId(row: Element): string | null {
+  const threadId = rowThreadId(row);
+  if (threadId) return threadId;
+  const title = inboxRowTitle(row);
+  return title && title !== "Instagram" ? `title-${stableHash(title)}` : null;
+}
+
+/**
+ * Instagram has shipped the inbox both as a list of thread anchors and as
+ * anchor-less list items whose click handler navigates. Anchors are preferred
+ * because they carry the thread id; the role-based rows are the fallback that
+ * keeps hiding and detection working on the builds that lack them.
+ */
+export function inboxRowElements(document: Document): HTMLElement[] {
+  const anchors = [...document.querySelectorAll<HTMLElement>('a[href*="/direct/t/"]')];
+  if (anchors.length) return anchors;
+  const candidates = [...document.querySelectorAll<HTMLElement>('[role="listitem"], [role="row"], [role="button"][tabindex="0"]')]
+    .filter((element) => Boolean(element.querySelector("img")) && normalizedText(element).length > 1);
+  // Rows nest inside one another in the fallback markup; keep the innermost.
+  return candidates.filter((element) => !candidates.some((other) => other !== element && element.contains(other)));
+}
+
 /**
  * Scans Instagram's own inbox conversation list, not the open thread, so new
  * messages are found regardless of which page (or which thread) is on screen.
  * Own last-sent messages are excluded; everything else is a notification candidate.
  */
 export function parseInboxList(document: Document, origin = "https://www.instagram.com"): InboxCandidate[] {
-  const rows = [...document.querySelectorAll<HTMLAnchorElement>('a[href*="/direct/t/"]')];
-  return rows.flatMap((row) => {
-    const conversationId = threadIdFromPath(row.getAttribute("href") ?? "");
+  return inboxRowElements(document).flatMap((row) => {
+    const conversationId = rowConversationId(row);
     if (!conversationId) return [];
     const preview = inboxRowPreview(row);
     if (!preview || isOwnLastMessage(row, preview)) return [];
+    const threadId = rowThreadId(row);
     return [{
       conversationId,
-      conversationUrl: new URL(`/direct/t/${conversationId}/`, origin).href,
+      conversationUrl: new URL(threadId ? `/direct/t/${threadId}/` : "/direct/inbox/", origin).href,
       sender: inboxRowTitle(row),
       preview,
       messageKey: stableHash(`${conversationId}|${preview}`),
@@ -366,11 +400,17 @@ export function installContentControls(win: Window): void {
     }
     return block;
   };
+  // Climbs to the wrapper that owns this one conversation and stops before any
+  // ancestor that owns a second one, so a whole list is never taken out with a
+  // single row — including on the markup where rows carry no thread anchor.
+  const rowCount = (element: Element): number =>
+    element.querySelectorAll('a[href*="/direct/t/"], [role="listitem"], [role="row"]').length;
   const enclosingRowBlock = (row: HTMLElement): HTMLElement => {
     let current: HTMLElement = row;
     while (current.parentElement && current.parentElement !== win.document.body) {
       const parent = current.parentElement;
-      if (parent.querySelectorAll('a[href*="/direct/t/"]').length > 1) break;
+      if (rowCount(parent) > Math.max(1, rowCount(current))) break;
+      if (parent.getAttribute("role") === "list") break;
       if (parent.tagName === "MAIN" || parent.tagName === "NAV" || parent.getAttribute("role") === "navigation" || parent.getAttribute("role") === "main") break;
       current = parent;
     }
@@ -425,20 +465,11 @@ export function installContentControls(win: Window): void {
 
     if (controls.hidePrivateChats || controls.hideGroupChats) {
       let hidden = 0;
-      const rows = win.document.querySelectorAll<HTMLAnchorElement>('a[href*="/direct/t/"]');
+      const rows = inboxRowElements(win.document);
       for (const row of rows) {
         const kind = inboxRowKind(row);
         if ((kind === "private" && controls.hidePrivateChats) || (kind === "group" && controls.hideGroupChats) || (controls.hidePrivateChats && controls.hideGroupChats)) {
           hide(enclosingRowBlock(row));
-          hidden++;
-        }
-      }
-      // Instagram has shipped inbox rows that are not anchors; with both kinds
-      // hidden there is nothing to classify, so the list items can go directly.
-      if (controls.hidePrivateChats && controls.hideGroupChats && !rows.length) {
-        for (const item of win.document.querySelectorAll<HTMLElement>('[role="listitem"]')) {
-          if (!item.querySelector("img")) continue;
-          hide(item);
           hidden++;
         }
       }

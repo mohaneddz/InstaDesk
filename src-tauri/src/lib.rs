@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
+// AtomicBool and Ordering are used both by the Windows keyboard hook and by
+// AppState::quitting, so import them unconditionally.
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc, OnceLock,
-};
+use std::sync::{mpsc, OnceLock};
 use std::{
     collections::{HashSet, VecDeque},
     fs,
@@ -17,7 +17,6 @@ use tauri::{
     WebviewUrl, WebviewWindowBuilder, Window, WindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt;
-#[cfg(not(windows))]
 use tauri_plugin_notification::NotificationExt;
 
 const INSTAGRAM_HOME: &str = "https://www.instagram.com/";
@@ -77,6 +76,41 @@ impl Default for Settings {
     }
 }
 
+/// Subset of settings exposed to the Instagram WebView for content controls.
+/// Notification and startup preferences are intentionally excluded so the
+/// remote page cannot observe or infer the user's notification configuration.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContentControls {
+    disable_home_feed: bool,
+    disable_reels: bool,
+    disable_explore: bool,
+    disable_search: bool,
+    disable_posts: bool,
+    disable_stories: bool,
+    disable_suggestions: bool,
+    ghost_stories: bool,
+    hide_private_chats: bool,
+    hide_group_chats: bool,
+}
+
+impl From<&Settings> for ContentControls {
+    fn from(s: &Settings) -> Self {
+        Self {
+            disable_home_feed: s.disable_home_feed,
+            disable_reels: s.disable_reels,
+            disable_explore: s.disable_explore,
+            disable_search: s.disable_search,
+            disable_posts: s.disable_posts,
+            disable_stories: s.disable_stories,
+            disable_suggestions: s.disable_suggestions,
+            ghost_stories: s.ghost_stories,
+            hide_private_chats: s.hide_private_chats,
+            hide_group_chats: s.hide_group_chats,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InboxMessage {
@@ -91,7 +125,9 @@ struct InboxMessage {
 struct AppState {
     settings: Mutex<Settings>,
     dedup: Mutex<(HashSet<String>, VecDeque<String>)>,
-    quitting: Mutex<bool>,
+    /// Uses an AtomicBool rather than a Mutex<bool> for lock-free reads in the
+    /// CloseRequested handler.
+    quitting: AtomicBool,
 }
 
 fn settings_path<R: Runtime>(app: &AppHandle<R>) -> Option<std::path::PathBuf> {
@@ -165,23 +201,13 @@ fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
     };
     let visible = window.is_visible().unwrap_or(false);
     let minimized = window.is_minimized().unwrap_or(false);
-    if visible && !minimized {
+    let focused = window.is_focused().unwrap_or(false);
+    if visible && !minimized && focused {
         hide_main_window(app, &window);
     } else {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
-    }
-}
-
-fn hide_main_window_if_open<R: Runtime>(app: &AppHandle<R>) {
-    let Some(window) = app.get_window("main") else {
-        return;
-    };
-    let visible = window.is_visible().unwrap_or(false);
-    let minimized = window.is_minimized().unwrap_or(false);
-    if visible && !minimized {
-        hide_main_window(app, &window);
     }
 }
 
@@ -192,10 +218,10 @@ unsafe extern "system" fn alt_toggle_hook(
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::{
-        Input::KeyboardAndMouse::{VK_LMENU, VK_RMENU},
+        Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LMENU, VK_MENU, VK_RMENU},
         WindowsAndMessaging::{
-            CallNextHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
-            WM_SYSKEYUP,
+            CallNextHookEx, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, WM_KEYDOWN, WM_KEYUP,
+            WM_SYSKEYDOWN, WM_SYSKEYUP,
         },
     };
 
@@ -204,22 +230,39 @@ unsafe extern "system" fn alt_toggle_hook(
         if !event.flags.contains(LLKHF_INJECTED) {
             let pressed = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let released = matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP);
-            let is_left_alt = event.vkCode == VK_LMENU.0 as u32;
-            let is_right_alt = event.vkCode == VK_RMENU.0 as u32;
-            if is_left_alt && (pressed || released) {
-                LEFT_ALT_DOWN.store(pressed, Ordering::SeqCst);
-            }
-            if is_right_alt && (pressed || released) {
-                RIGHT_ALT_DOWN.store(pressed, Ordering::SeqCst);
-            }
-            if released && (is_left_alt || is_right_alt) {
-                ALT_TOGGLE_FIRED.store(false, Ordering::SeqCst);
-            } else if LEFT_ALT_DOWN.load(Ordering::SeqCst)
-                && RIGHT_ALT_DOWN.load(Ordering::SeqCst)
-                && !ALT_TOGGLE_FIRED.swap(true, Ordering::SeqCst)
-            {
-                if let Some(sender) = ALT_TOGGLE_SENDER.get() {
-                    let _ = sender.send(());
+
+            let is_alt = event.vkCode == VK_LMENU.0 as u32
+                || event.vkCode == VK_RMENU.0 as u32
+                || event.vkCode == VK_MENU.0 as u32;
+
+            if is_alt {
+                let is_right_alt = event.vkCode == VK_RMENU.0 as u32
+                    || (event.vkCode == VK_MENU.0 as u32 && event.flags.contains(LLKHF_EXTENDED));
+                let is_left_alt = event.vkCode == VK_LMENU.0 as u32
+                    || (event.vkCode == VK_MENU.0 as u32 && !event.flags.contains(LLKHF_EXTENDED));
+
+                if is_left_alt && (pressed || released) {
+                    LEFT_ALT_DOWN.store(pressed, Ordering::SeqCst);
+                }
+                if is_right_alt && (pressed || released) {
+                    RIGHT_ALT_DOWN.store(pressed, Ordering::SeqCst);
+                }
+
+                let left_phys = (GetAsyncKeyState(VK_LMENU.0 as i32) as u16 & 0x8000) != 0;
+                let right_phys = (GetAsyncKeyState(VK_RMENU.0 as i32) as u16 & 0x8000) != 0;
+
+                let left_active = LEFT_ALT_DOWN.load(Ordering::SeqCst) || left_phys;
+                let right_active = RIGHT_ALT_DOWN.load(Ordering::SeqCst) || right_phys;
+
+                if released && (is_left_alt || is_right_alt) {
+                    ALT_TOGGLE_FIRED.store(false, Ordering::SeqCst);
+                } else if left_active
+                    && right_active
+                    && !ALT_TOGGLE_FIRED.swap(true, Ordering::SeqCst)
+                {
+                    if let Some(sender) = ALT_TOGGLE_SENDER.get() {
+                        let _ = sender.send(());
+                    }
                 }
             }
         }
@@ -254,6 +297,51 @@ fn install_alt_toggle<R: Runtime>(app: &AppHandle<R>) {
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {}
         let _ = windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(hook);
+    });
+}
+
+#[cfg(windows)]
+fn ensure_windows_shortcut_registered() {
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    if appdata.is_empty() {
+        return;
+    }
+    let shortcut_path = std::path::PathBuf::from(&appdata)
+        .join(r"Microsoft\Windows\Start Menu\Programs\InstaDesk.lnk");
+    if shortcut_path.exists() {
+        return;
+    }
+    let Ok(current_exe) = std::env::current_exe() else {
+        return;
+    };
+    let current_exe_str = current_exe.to_string_lossy();
+    let shortcut_str = shortcut_path.to_string_lossy();
+
+    let script = format!(
+        r#"$c = @'
+using System;
+using System.Runtime.InteropServices;
+[ComImport, Guid("00021401-0000-0000-C000-000000000046")] public class ShellLink {{}}
+[ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("000214F9-0000-0000-C000-000000000046")] public interface IShellLinkW {{ void GetPath(IntPtr a, int b, IntPtr c, uint d); void GetIDList(out IntPtr a); void SetIDList(IntPtr a); void GetDescription(IntPtr a, int b); void SetDescription(string a); void GetWorkingDirectory(IntPtr a, int b); void SetWorkingDirectory(string a); void GetArguments(IntPtr a, int b); void SetArguments(string a); void GetHotkey(out short a); void SetHotkey(short a); void GetShowCmd(out int a); void SetShowCmd(int a); void GetIconLocation(IntPtr a, int b, out int c); void SetIconLocation(string a, int b); void SetRelativePath(string a, uint b); void Resolve(IntPtr a, uint b); void SetPath([MarshalAs(UnmanagedType.LPWStr)] string a); }}
+[ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")] public interface IPropertyStore {{ uint GetCount(); void GetAt(uint i, out PropertyKey k); void GetValue(ref PropertyKey k, out PropVariant v); void SetValue(ref PropertyKey k, ref PropVariant v); void Commit(); }}
+[StructLayout(LayoutKind.Sequential, Pack = 4)] public struct PropertyKey {{ public Guid fmtid; public uint pid; public PropertyKey(Guid g, uint id) {{ fmtid = g; pid = id; }} }}
+[StructLayout(LayoutKind.Explicit)] public struct PropVariant {{ [FieldOffset(0)] public ushort vt; [FieldOffset(8)] public IntPtr pwszVal; public static PropVariant FromString(string val) {{ var pv = new PropVariant(); pv.vt = 31; pv.pwszVal = Marshal.StringToCoTaskMemUni(val); return pv; }} }}
+public class H {{ public static void S(string lPath, string tPath, string aumid) {{ var l = (IShellLinkW)new ShellLink(); l.SetPath(tPath); var ps = (IPropertyStore)l; var k = new PropertyKey(new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), 5); var pv = PropVariant.FromString(aumid); ps.SetValue(ref k, ref pv); ps.Commit(); ((System.Runtime.InteropServices.ComTypes.IPersistFile)l).Save(lPath, true); }} }}
+'@
+Add-Type -TypeDefinition $c
+[H]::S('{}', '{}', 'com.instadesk.desktop')
+"#,
+        shortcut_str.replace('\'', "''"),
+        current_exe_str.replace('\'', "''")
+    );
+
+    std::thread::spawn(move || {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
     });
 }
 
@@ -321,8 +409,8 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
         WebviewBuilder::new("inbox", WebviewUrl::External(inbox_url))
             .initialization_script(inbox_init)
             .on_navigation(|url| instagram_url(url.as_str()).is_some()),
-        PhysicalPosition::new(-10_000, -10_000),
-        PhysicalSize::new(1, 1),
+        PhysicalPosition::new(-20_000, -20_000),
+        PhysicalSize::new(1280, 800),
     )?;
     let handle = app.clone();
     window.on_window_event(move |event| match event {
@@ -333,7 +421,8 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
         }
         WindowEvent::CloseRequested { api, .. } => {
             let state = handle.state::<AppState>();
-            let quitting = state.quitting.lock().map(|v| *v).unwrap_or(false);
+            // Lock-free read; quitting is set with SeqCst store on quit.
+            let quitting = state.quitting.load(Ordering::SeqCst);
             let minimize = state
                 .settings
                 .lock()
@@ -410,45 +499,63 @@ fn dispatch_notification<R: Runtime>(
     destination: &str,
     kind: &str,
 ) -> Result<(), String> {
-    let destination = instagram_url(destination)
-        .map(|u| u.to_string())
-        .unwrap_or_else(|| INSTAGRAM_INBOX.to_string());
+    if let Ok(state) = app.notification().permission_state() {
+        if !matches!(state, tauri_plugin_notification::PermissionState::Granted) {
+            let _ = app.notification().request_permission();
+        }
+    }
     let title = if kind == "group" {
-        format!("Instagram Group — {sender}")
+        format!("{sender} (Group)")
     } else {
         format!("Instagram — {sender}")
     };
-    #[cfg(windows)]
-    {
-        let mut toast = notify_rust::Notification::new();
-        toast
-            .summary(&title)
-            .body(preview)
-            .app_id("com.instadesk.desktop");
-        let handle = toast.show().map_err(|e| e.to_string())?;
-        let app = app.clone();
-        std::thread::spawn(move || {
-            handle.wait_for_action(move |action| {
-                if action != "__closed" {
-                    show_instagram(&app, Some(&destination));
-                }
-            })
-        });
-        return Ok(());
+    let body = if preview.trim().is_empty() {
+        "Sent you a new message"
+    } else {
+        preview.trim()
+    };
+    let mut builder = app.notification().builder();
+    builder = builder.title(title).body(body);
+
+    let resolved_icon = if let Ok(abs) = std::fs::canonicalize("icons/128x128.png") {
+        Some(abs.to_string_lossy().trim_start_matches(r"\\?\").to_string())
+    } else if let Ok(res_dir) = app.path().resource_dir() {
+        let p = res_dir.join("icons/128x128.png");
+        if p.exists() {
+            Some(p.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(icon) = resolved_icon {
+        builder = builder.icon(icon);
     }
-    #[cfg(not(windows))]
-    app.notification()
-        .builder()
-        .title(title)
-        .body(preview)
-        .show()
-        .map_err(|e| e.to_string())
+
+    let result = builder.show().map_err(|e| e.to_string());
+
+    if !destination.is_empty() && destination != INSTAGRAM_INBOX {
+        let main_win = app.get_window("main");
+        let is_active = main_win
+            .as_ref()
+            .map(|w| w.is_visible().unwrap_or(false) && w.is_focused().unwrap_or(false))
+            .unwrap_or(false);
+        if !is_active {
+            if let Some(instagram) = app.get_webview("instagram") {
+                navigate(&instagram, destination);
+            }
+        }
+    }
+
+    result
 }
 
 #[tauri::command]
 fn incoming_message(app: AppHandle, webview: Webview, message: InboxMessage) -> Result<(), String> {
-    if webview.label() != "inbox" {
-        return Err("Inbox events are accepted only from the background inbox WebView".into());
+    if webview.label() != "inbox" && webview.label() != "instagram" {
+        return Err("Inbox events are accepted only from Instagram WebViews".into());
     }
     // Defense in depth: the injected adapter can only send HTTPS Instagram thread URLs.
     let Some(destination) = instagram_url(&message.conversation_url) else {
@@ -460,19 +567,29 @@ fn incoming_message(app: AppHandle, webview: Webview, message: InboxMessage) -> 
     {
         return Err("Rejected incomplete message candidate".into());
     }
-    let kind = if message.kind == "group" { "group" } else { "private" };
+    let kind = match message.kind.as_str() {
+        "group" => "group",
+        _ => "private",
+    };
     let state = app.state::<AppState>();
     let settings = state
         .settings
         .lock()
         .map_err(|_| "settings lock poisoned")?
         .clone();
+    // A hidden conversation is meant to be gone, not merely unreachable, so it
+    // never announces itself regardless of the notification toggles.
+    let hidden = if kind == "group" {
+        settings.hide_group_chats
+    } else {
+        settings.hide_private_chats
+    };
     let allowed = if kind == "group" {
         settings.notify_group
     } else {
         settings.notify_private
     };
-    if !allowed {
+    if hidden || !allowed {
         return Ok(());
     }
     let key = format!("{}:{}", message.conversation_id, message.message_key);
@@ -551,14 +668,14 @@ fn update_settings(
 }
 
 #[tauri::command]
-fn get_content_controls(app: AppHandle, webview: Webview) -> Result<Settings, String> {
+fn get_content_controls(app: AppHandle, webview: Webview) -> Result<ContentControls, String> {
     if webview.label() != "instagram" {
         return Err("Content controls are available only to the Instagram WebView".into());
     }
     app.state::<AppState>()
         .settings
         .lock()
-        .map(|settings| settings.clone())
+        .map(|settings| ContentControls::from(&*settings))
         .map_err(|_| "settings lock poisoned".into())
 }
 
@@ -804,7 +921,7 @@ fn window_action(app: AppHandle, webview: Webview, action: &str) -> Result<(), S
         ("instagram", "forward") => webview
             .eval("history.forward()")
             .map_err(|e| e.to_string())?,
-        ("instagram", "hide_if_open") => hide_main_window_if_open(&app),
+        ("main" | "instagram" | "settings", "toggle_window") => toggle_main_window(&app),
         ("settings", "drag_settings") => window.start_dragging().map_err(|e| e.to_string())?,
         ("settings", "close_settings") => window.hide().map_err(|e| e.to_string())?,
         _ => return Err("Window action is not allowed for this WebView".into()),
@@ -835,31 +952,37 @@ fn set_autostart<R: Runtime>(app: &AppHandle<R>, enabled: bool) {
 
 fn toggle_setting<R: Runtime>(app: &AppHandle<R>, field: &str) {
     let state = app.state::<AppState>();
-    if let Ok(mut settings) = state.settings.lock() {
+    // Clone settings out of the lock before rebuilding the tray, so the lock
+    // is not held when build_tray registers menu-event closures that may later
+    // try to acquire it.
+    let settings = {
+        let Ok(mut guard) = state.settings.lock() else { return; };
         match field {
-            "notifyPrivate" => settings.notify_private = !settings.notify_private,
-            "notifyGroup" => settings.notify_group = !settings.notify_group,
-            "previews" => settings.notification_previews = !settings.notification_previews,
-            "minimize" => settings.minimize_to_tray = !settings.minimize_to_tray,
+            "notifyPrivate" => guard.notify_private = !guard.notify_private,
+            "notifyGroup" => guard.notify_group = !guard.notify_group,
+            "previews" => guard.notification_previews = !guard.notification_previews,
+            "minimize" => guard.minimize_to_tray = !guard.minimize_to_tray,
             "autostart" => {
-                settings.launch_at_startup = !settings.launch_at_startup;
-                set_autostart(app, settings.launch_at_startup);
+                guard.launch_at_startup = !guard.launch_at_startup;
+                set_autostart(app, guard.launch_at_startup);
             }
-            "hidePrivateChats" => settings.hide_private_chats = !settings.hide_private_chats,
-            "hideGroupChats" => settings.hide_group_chats = !settings.hide_group_chats,
+            "hidePrivateChats" => guard.hide_private_chats = !guard.hide_private_chats,
+            "hideGroupChats" => guard.hide_group_chats = !guard.hide_group_chats,
             _ => return,
         }
-        save_settings(app, &settings);
-        if matches!(field, "hidePrivateChats" | "hideGroupChats") {
-            if let (Some(instagram), Ok(settings_json)) =
-                (app.get_webview("instagram"), serde_json::to_string(&*settings))
-            {
-                let _ = instagram.eval(format!(
-                    "window.dispatchEvent(new CustomEvent('instadesk:settings-changed', {{ detail: {settings_json} }}))"
-                ));
-            }
+        save_settings(app, &guard);
+        if let (Some(instagram), Ok(settings_json)) =
+            (app.get_webview("instagram"), serde_json::to_string(&*guard))
+        {
+            let _ = instagram.eval(format!(
+                "window.dispatchEvent(new CustomEvent('instadesk:settings-changed', {{ detail: {settings_json} }}))"
+            ));
         }
-    };
+        guard.clone()
+    }; // settings lock released here
+    // Rebuild the tray so checkmarks reflect the new value immediately.
+    let _ = app.remove_tray_by_id("instadesk-tray");
+    let _ = build_tray(app, &settings);
 }
 
 fn build_tray<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> tauri::Result<()> {
@@ -922,16 +1045,10 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> tauri::Res
         settings.hide_group_chats,
         None::<&str>,
     )?;
-    let test = MenuItem::with_id(
-        app,
-        "test",
-        "Test Notification (development)",
-        cfg!(debug_assertions),
-        None::<&str>,
-    )?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
+    let test = MenuItem::with_id(app, "test", "Test Notification", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
@@ -965,19 +1082,17 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> tauri::Res
             "settings" => show_settings(app),
             "notifyPrivate" | "notifyGroup" | "previews" | "minimize" | "autostart"
             | "hidePrivateChats" | "hideGroupChats" => toggle_setting(app, event.id.as_ref()),
-            "test" if cfg!(debug_assertions) => {
+            "test" => {
                 let _ = dispatch_notification(
                     app,
                     "Test User",
-                    "This is a test private message.",
+                    "This is a test notification from InstaDesk.",
                     INSTAGRAM_INBOX,
                     "private",
                 );
             }
             "quit" => {
-                if let Ok(mut q) = app.state::<AppState>().quitting.lock() {
-                    *q = true;
-                }
+                app.state::<AppState>().quitting.store(true, Ordering::SeqCst);
                 app.exit(0);
             }
             _ => {}
@@ -1009,10 +1124,23 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![incoming_message, get_settings, update_settings, get_content_controls, window_action, settings_ui_ready, download_media, copy_image])
         .setup(|app| {
             let settings = load_settings(app.handle());
-            app.manage(AppState { settings: Mutex::new(settings.clone()), dedup: Mutex::new((HashSet::new(), VecDeque::new())), quitting: Mutex::new(false) });
+            app.manage(AppState {
+                settings: Mutex::new(settings.clone()),
+                dedup: Mutex::new((HashSet::new(), VecDeque::new())),
+                quitting: AtomicBool::new(false),
+            });
             build_tray(app.handle(), &settings)?;
             create_settings_window(app.handle())?;
             let window = create_main_window(app.handle())?;
+            #[cfg(windows)]
+            {
+                unsafe {
+                    use windows::core::HSTRING;
+                    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+                    let _ = SetCurrentProcessExplicitAppUserModelID(&HSTRING::from("com.instadesk.desktop"));
+                }
+                ensure_windows_shortcut_registered();
+            }
             #[cfg(windows)]
             install_alt_toggle(app.handle());
             if std::env::args().any(|arg| arg == "--hidden") { let _ = window.hide(); }
@@ -1021,7 +1149,14 @@ pub fn run() {
             if std::env::args().any(|arg| arg == "--ipc-self-test") {
                 let chrome = app.get_webview("main");
                 tauri::async_runtime::spawn(async move {
-                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    // Use a blocking sleep on a dedicated thread so the async
+                    // executor thread is not stalled during the 5-second wait.
+                    let (tx, rx) = std::sync::mpsc::channel::<()>();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        let _ = tx.send(());
+                    });
+                    let _ = rx.recv();
                     if let Some(chrome) = chrome {
                         let _ = chrome.eval(r#"window.__TAURI_INTERNALS__.invoke('window_action', { action: 'settings' })
                             .then(() => console.debug('[InstaDesk] IPC self-test passed'))
@@ -1029,16 +1164,15 @@ pub fn run() {
                     }
                 });
             }
-            #[cfg(debug_assertions)]
             if std::env::args().any(|arg| arg == "--test-notification") {
-                dispatch_notification(app.handle(), "Test User", "This is a test private message.", INSTAGRAM_INBOX, "private")
+                dispatch_notification(app.handle(), "Test User", "This is a test notification from InstaDesk.", INSTAGRAM_INBOX, "private")
                     .map_err(std::io::Error::other)?;
-                eprintln!("[InstaDesk] development notification dispatched successfully");
+                eprintln!("[InstaDesk] test notification dispatched successfully");
             }
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running InstaDesk");
+        .expect("error while running InstaDesk")
 }
 
 #[cfg(test)]
@@ -1058,7 +1192,7 @@ mod tests {
         let state = AppState {
             settings: Mutex::new(Settings::default()),
             dedup: Mutex::new((HashSet::new(), VecDeque::new())),
-            quitting: Mutex::new(false),
+            quitting: AtomicBool::new(false),
         };
         assert!(is_new_message(&state, "thread:message".into()));
         assert!(!is_new_message(&state, "thread:message".into()));
