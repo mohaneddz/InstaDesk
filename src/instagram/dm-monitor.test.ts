@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { blockedDestination, classifyThread, inboxRowKind, installContentControls, installNavigationShortcuts, parseInboxList, postMediaSources, threadIdFromPath } from "./dm-monitor";
+import { blockedDestination, classifyThread, inboxEventKind, inboxRowKind, inboxRowMuted, installContentControls, installNavigationShortcuts, parseInboxList, postMediaSources, threadIdFromPath } from "./dm-monitor";
 
 function page(header: string, rows: string): Document {
   document.body.innerHTML = `<main><header>${header}</header><section>${rows}</section></main>`;
@@ -235,6 +235,33 @@ describe("content controls", () => {
     expect(item.sender).toBe("Alice, Bob, Charlie");
     expect(item.preview).toBe("Hey all");
     expect(item.kind).toBe("group");
+  });
+});
+
+describe("inbox event classifier", () => {
+  it("names reactions, typing, story replies and note replies", () => {
+    expect(inboxEventKind("Liked your message")).toBe("reaction");
+    expect(inboxEventKind("Reacted 😂 to your message")).toBe("reaction");
+    expect(inboxEventKind("Sarah is typing")).toBe("typing");
+    expect(inboxEventKind("Replied to your story")).toBe("storyReply");
+    expect(inboxEventKind("Replied to your note")).toBe("noteReply");
+    expect(inboxEventKind("bro look at this")).toBe("message");
+    expect(inboxEventKind("sent an attachment")).toBe("message");
+  });
+
+  it("reports muted conversations from the row's own markup", () => {
+    document.body.innerHTML = `<main>
+      <a id="muted" href="/direct/t/1/"><span>Sarah</span><span>hey</span><img src="/a.jpg"><svg aria-label="Muted"></svg></a>
+      <a id="loud" href="/direct/t/2/"><span>Mike</span><span>hey</span><img src="/b.jpg"></a>
+    </main>`;
+    expect(inboxRowMuted(document.querySelector("#muted")!)).toBe(true);
+    expect(inboxRowMuted(document.querySelector("#loud")!)).toBe(false);
+  });
+
+  it("carries the event and muted flag through to the candidate", () => {
+    document.body.innerHTML = '<main><a href="/direct/t/5/"><span>Sarah</span><span>Liked your message</span><img src="/a.jpg"></a></main>';
+    const [item] = parseInboxList(document);
+    expect(item).toMatchObject({ event: "reaction", muted: false });
   });
 });
 

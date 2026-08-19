@@ -4,6 +4,14 @@ import "./settings.css";
 interface Settings {
   notifyPrivate: boolean;
   notifyGroup: boolean;
+  notifyMessages: boolean;
+  notifyReactions: boolean;
+  notifyTyping: boolean;
+  notifyStoryReplies: boolean;
+  notifyNoteReplies: boolean;
+  notifyMutedChats: boolean;
+  senderFilterMode: "off" | "whitelist" | "blacklist";
+  senderFilterList: string[];
   launchAtStartup: boolean;
   minimizeToTray: boolean;
   notificationPreviews: boolean;
@@ -35,6 +43,28 @@ app.innerHTML = `
       <label><span><b>Minimize to tray</b><small>Keep Instagram running when its window is closed.</small></span><input id="minimizeToTray" type="checkbox"><i></i></label>
       <label><span><b>Launch on startup</b><small>Start InstaDesk quietly with Windows.</small></span><input id="launchAtStartup" type="checkbox"><i></i></label>
     </div>
+    <div class="section-heading"><span><b>Notification filters</b><small>Pick which kinds of activity are worth interrupting you.</small></span></div>
+    <div class="settings-list">
+      <label><span><b>Messages</b><small>New direct messages and attachments.</small></span><input id="notifyMessages" type="checkbox"><i></i></label>
+      <label><span><b>Reactions</b><small>Likes and emoji reactions to your messages.</small></span><input id="notifyReactions" type="checkbox"><i></i></label>
+      <label><span><b>Typing indicators</b><small>Someone starting to type in a conversation.</small></span><input id="notifyTyping" type="checkbox"><i></i></label>
+      <label><span><b>Story replies</b><small>Replies and reactions to your stories.</small></span><input id="notifyStoryReplies" type="checkbox"><i></i></label>
+      <label><span><b>Note replies</b><small>Replies to the note on your profile.</small></span><input id="notifyNoteReplies" type="checkbox"><i></i></label>
+      <label><span><b>Muted conversations</b><small>Notify even for chats you muted on Instagram.</small></span><input id="notifyMutedChats" type="checkbox"><i></i></label>
+    </div>
+    <div class="section-heading"><span><b>Sender filter</b><small>Limit notifications to specific people, or silence a few.</small></span></div>
+    <div class="settings-list sender-filter">
+      <label class="select-row"><span><b>Filter mode</b><small>Whitelist notifies only the listed names; blacklist notifies everyone else.</small></span>
+        <select id="senderFilterMode">
+          <option value="off">Off</option>
+          <option value="whitelist">Whitelist</option>
+          <option value="blacklist">Blacklist</option>
+        </select>
+      </label>
+      <label class="list-row"><span><b>Names</b><small>One per line, as they appear in your inbox.</small></span>
+        <textarea id="senderFilterList" rows="4" spellcheck="false" placeholder="sarah&#10;@mike"></textarea>
+      </label>
+    </div>
     <div class="section-heading"><span><b>Content controls</b><small>Hide distractions and keep Instagram focused on messages.</small></span></div>
     <div class="settings-list content-controls">
       <label><span><b>Disable Home feed</b><small>Open DMs instead of the main feed.</small></span><input id="disableHomeFeed" type="checkbox"><i></i></label>
@@ -65,8 +95,11 @@ app.innerHTML = `
   </section>`;
 
 const status = document.querySelector<HTMLElement>("#status")!;
-const keys: (keyof Settings)[] = [
+type ToggleKey = { [K in keyof Settings]: Settings[K] extends boolean ? K : never }[keyof Settings];
+
+const keys: ToggleKey[] = [
   "notifyPrivate", "notifyGroup", "notificationPreviews", "minimizeToTray", "launchAtStartup",
+  "notifyMessages", "notifyReactions", "notifyTyping", "notifyStoryReplies", "notifyNoteReplies", "notifyMutedChats",
   "disableHomeFeed", "disableReels", "disableExplore", "disableSearch",
   "disablePosts", "disableStories", "disableSuggestions", "ghostStories",
   "hidePrivateChats", "hideGroupChats"
@@ -77,29 +110,57 @@ const keys: (keyof Settings)[] = [
 let current: Settings | undefined;
 void invoke("settings_ui_ready");
 
+const LINE_BREAK = String.fromCharCode(10);
+const filterMode = document.querySelector<HTMLSelectElement>("#senderFilterMode")!;
+const filterList = document.querySelector<HTMLTextAreaElement>("#senderFilterList")!;
+
 async function load(): Promise<void> {
   current = await invoke<Settings>("get_settings");
   for (const key of keys) document.querySelector<HTMLInputElement>(`#${key}`)!.checked = current[key];
+  filterMode.value = current.senderFilterMode;
+  // Never stomp on a name the user is in the middle of typing.
+  if (document.activeElement !== filterList) filterList.value = current.senderFilterList.join(LINE_BREAK);
+}
+
+async function save(): Promise<void> {
+  if (!current) return;
+  status.textContent = "Saving…";
+  try {
+    current = await invoke<Settings>("update_settings", { settings: current });
+    status.textContent = "Saved";
+    // Reset the status message after a short delay so it doesn't stick forever.
+    setTimeout(() => {
+      if (status.textContent === "Saved") status.textContent = "Settings save automatically";
+    }, 2000);
+  } catch (error) {
+    status.textContent = `Could not save: ${String(error)}`;
+    await load();
+  }
 }
 
 for (const key of keys) {
   document.querySelector<HTMLInputElement>(`#${key}`)!.addEventListener("change", async (event) => {
     if (!current) return; // load() hasn't resolved yet — ignore the premature event
     current[key] = (event.currentTarget as HTMLInputElement).checked;
-    status.textContent = "Saving…";
-    try {
-      current = await invoke<Settings>("update_settings", { settings: current });
-      status.textContent = "Saved";
-      // Reset the status message after a short delay so it doesn't stick forever.
-      setTimeout(() => {
-        if (status.textContent === "Saved") status.textContent = "Settings save automatically";
-      }, 2000);
-    } catch (error) {
-      status.textContent = `Could not save: ${String(error)}`;
-      await load();
-    }
+    await save();
   });
 }
+
+filterMode.addEventListener("change", async () => {
+  if (!current) return;
+  current.senderFilterMode = filterMode.value as Settings["senderFilterMode"];
+  await save();
+});
+
+// The list is edited as free text; it is saved when the field loses focus
+// rather than on every keystroke, so a half-typed name never takes effect.
+filterList.addEventListener("blur", async () => {
+  if (!current) return;
+  const names = filterList.value.split(LINE_BREAK).map((line) => line.trim()).filter(Boolean);
+  if (names.join(LINE_BREAK) === current.senderFilterList.join(LINE_BREAK)) return;
+  current.senderFilterList = names;
+  await save();
+});
 
 document.querySelector(".close")!.addEventListener("click", () => void invoke("window_action", { action: "close_settings" }));
 document.querySelector(".titlebar")!.addEventListener("pointerdown", (event) => {

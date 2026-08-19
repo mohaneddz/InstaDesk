@@ -169,6 +169,21 @@
     }
     return { kind: "unknown" };
   }
+  var REACTION_RE = /(?:liked your message|reacted (?:\S+ )?to your message|reacted to (?:your|a) message)/i;
+  var TYPING_RE = /(?:is typing|typing…|typing\.\.\.)/i;
+  var STORY_REPLY_RE = /(?:replied to your story|sent a story reply|reacted to your story|mentioned you in (?:their|a) story)/i;
+  var NOTE_REPLY_RE = /(?:replied to your note|reacted to your note)/i;
+  function inboxEventKind(preview) {
+    if (TYPING_RE.test(preview)) return "typing";
+    if (NOTE_REPLY_RE.test(preview)) return "noteReply";
+    if (STORY_REPLY_RE.test(preview)) return "storyReply";
+    if (REACTION_RE.test(preview)) return "reaction";
+    return "message";
+  }
+  function inboxRowMuted(row) {
+    if (row.querySelector('[aria-label*="muted" i], [aria-label*="notifications are off" i], svg[aria-label*="mute" i]')) return true;
+    return /muted/i.test(row.getAttribute("aria-label") ?? "");
+  }
   function inboxRowTitle(row) {
     const directSpans = [...row.querySelectorAll("span, div, h2, h3, h4")].filter((el) => el.children.length === 0).map((el) => normalizedText(el)).filter((txt) => txt.length > 0 && !TIME_ONLY.test(txt) && txt !== "\xB7");
     if (directSpans.length > 0) {
@@ -258,7 +273,9 @@
         sender: inboxRowTitle(row),
         preview,
         messageKey: stableHash(`${conversationId}|${preview}`),
-        kind: inboxRowKind(row)
+        kind: inboxRowKind(row),
+        event: inboxEventKind(preview),
+        muted: inboxRowMuted(row)
       }];
     });
   }
@@ -348,7 +365,7 @@
     const unreadBadges = () => {
       const found = [];
       for (const labelled of win.document.querySelectorAll("[aria-label]")) {
-        if (/unread/i.test(labelled.getAttribute("aria-label") ?? "")) hide(labelled);
+        if (/unread/i.test(labelled.getAttribute("aria-label") ?? "")) hide(labelled);
       }
       for (const link of win.document.querySelectorAll('a[href*="/direct/"], [role="link"]')) {
         for (const leaf of link.querySelectorAll("span, div")) {
@@ -858,7 +875,7 @@
         for (const item of candidates) {
           if (seen.get(item.conversationId) === item.messageKey) continue;
           seen.set(item.conversationId, item.messageKey);
-          report("incoming message detected", `${item.kind} from ${item.sender}`);
+          report("incoming message detected", `${item.kind} ${item.event}${item.muted ? " (muted)" : ""} from ${item.sender}`);
           void win.__TAURI_INTERNALS__?.invoke("incoming_message", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
         }
       } catch (error) {
