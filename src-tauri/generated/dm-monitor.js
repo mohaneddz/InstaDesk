@@ -560,8 +560,15 @@
   function installPostMediaActions(win) {
     if (win.__INSTADESK_MEDIA_ACTIONS__) return;
     win.__INSTADESK_MEDIA_ACTIONS__ = true;
+    const isPost = (article) => {
+      if (article.parentElement?.closest("article")) return false;
+      if (/^\/direct(?:\/|$)|^\/stories(?:\/|$)/.test(win.location?.pathname ?? "")) return false;
+      if (article.getBoundingClientRect().width < 250) return false;
+      return downloadableMedia(article).length > 0;
+    };
     const enhance = () => {
       for (const article of win.document.querySelectorAll("article:not([data-instadesk-media-actions])")) {
+        if (!isPost(article)) continue;
         article.dataset.instadeskMediaActions = "";
         if (win.getComputedStyle(article).position === "static") article.style.setProperty("position", "relative");
         const host = win.document.createElement("div");
@@ -620,25 +627,51 @@
     new MutationObserver(enhance).observe(win.document.body, { childList: true, subtree: true });
     enhance();
   }
-  var STORY_SEEN_URL_PATTERN = /stor(y|ies)[_-]?(seen|viewed)|reel[_-]?(media[_-]?)?seen|seen[_-]?stor(y|ies)|media\/seen/i;
-  var STORY_SEEN_BODY_PATTERN = /reel[_-]?seen|stor(y|ies)[_-]?seen|seenState|PolarisStoriesV3ReelSeenMutation/i;
-  function looksLikeStorySeenRequest(url, body) {
+  var STORY_SEEN_URL_PATTERN = /stor(y|ies)[_\-/]?(seen|viewed)|reel[_\-/]?(media[_\-/]?)?seen|seen[_\-/]?stor(y|ies)|media\/seen/i;
+  var STORY_SEEN_TOKEN = /(reel|stor(y|ies)|media)[_\-/]?(seen|viewed)|(seen|viewed)[_\-/]?(reel|stor(y|ies)|media|state)|mark[_\-/]?(as[_\-/]?)?seen|seen[_\-/]?mutation|seenmutation/i;
+  function looksLikeStorySeenRequest(url, body, method = "GET") {
     if (STORY_SEEN_URL_PATTERN.test(url)) return true;
-    return Boolean(body && url.includes("/graphql/") && STORY_SEEN_BODY_PATTERN.test(body));
+    if (method.toUpperCase() === "GET") return false;
+    return STORY_SEEN_TOKEN.test(`${url} ${body ?? ""}`);
+  }
+  function requestOperation(url, body) {
+    const name = body?.match(/fb_api_req_friendly_name=([^&\s]+)/)?.[1] ?? body?.match(/"?operationName"?\s*[:=]\s*"?([A-Za-z0-9_]+)/)?.[1];
+    let path = url;
+    try {
+      path = new URL(url, "https://www.instagram.com").pathname;
+    } catch {
+    }
+    return name ? `${path} (${name})` : path;
   }
   function installGhostStories(win) {
     if (win.__INSTADESK_GHOST__) return;
     win.__INSTADESK_GHOST__ = true;
     const enabled = () => Boolean(win.__INSTADESK_CONTENT_CONTROLS__?.ghostStories);
+    let reports = 0;
+    const report = (label, detail) => {
+      console.debug(`[InstaDesk] ${label}`, detail);
+      if (reports++ > 20) return;
+      void win.__TAURI_INTERNALS__?.invoke("report_diagnostic", { label, detail }).catch(() => {
+      });
+    };
+    const noteNearMiss = (url, body, method) => {
+      if (!enabled() || method.toUpperCase() === "GET") return;
+      const haystack = `${url} ${body ?? ""}`;
+      if (/stor(y|ies)|reel/i.test(haystack) && /seen|view|impression/i.test(haystack)) {
+        report("ghost mode let a story write through", requestOperation(url, body));
+      }
+    };
     const nativeFetch = win.fetch.bind(win);
     win.fetch = (async (input, init) => {
       try {
         const raw = typeof input === "string" || input instanceof URL ? input.toString() : input.url;
         const body = typeof init?.body === "string" ? init.body : void 0;
-        if (enabled() && looksLikeStorySeenRequest(raw, body)) {
-          console.debug("[InstaDesk] ghost mode suppressed a story view receipt");
+        const method = init?.method ?? (typeof input === "object" && "method" in input ? input.method : "GET");
+        if (enabled() && looksLikeStorySeenRequest(raw, body, method)) {
+          report("ghost mode suppressed a story view receipt", requestOperation(raw, body));
           return new Response(null, { status: 204 });
         }
+        noteNearMiss(raw, body, method);
       } catch {
       }
       return nativeFetch(input, init);
@@ -648,13 +681,16 @@
     const nativeSend = XHR.send;
     XHR.open = function(method, url, ...rest) {
       this.__instadeskUrl = String(url);
+      this.__instadeskMethod = method;
       return nativeOpen.apply(this, [method, url, ...rest]);
     };
     XHR.send = function(body) {
       const url = this.__instadeskUrl;
+      const method = this.__instadeskMethod ?? "GET";
       const bodyText = typeof body === "string" ? body : void 0;
-      if (enabled() && url && looksLikeStorySeenRequest(url, bodyText)) {
-        console.debug("[InstaDesk] ghost mode suppressed a story view receipt (xhr)");
+      if (url) noteNearMiss(url, bodyText, method);
+      if (enabled() && url && looksLikeStorySeenRequest(url, bodyText, method)) {
+        report("ghost mode suppressed a story view receipt (xhr)", requestOperation(url, bodyText));
         win.setTimeout(() => {
           Object.defineProperty(this, "readyState", { value: 4, configurable: true });
           Object.defineProperty(this, "status", { value: 204, configurable: true });
@@ -671,8 +707,8 @@
       win.navigator.sendBeacon = (url, data) => {
         const urlStr = String(url);
         const bodyText = typeof data === "string" ? data : void 0;
-        if (enabled() && looksLikeStorySeenRequest(urlStr, bodyText)) {
-          console.debug("[InstaDesk] ghost mode suppressed a story view receipt (sendBeacon)");
+        if (enabled() && looksLikeStorySeenRequest(urlStr, bodyText, "POST")) {
+          report("ghost mode suppressed a story view receipt (sendBeacon)", requestOperation(urlStr, bodyText));
           return true;
         }
         return nativeSendBeacon(url, data);

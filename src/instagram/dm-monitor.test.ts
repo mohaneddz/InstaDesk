@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { blockedDestination, classifyThread, inboxEventKind, inboxRowKind, inboxRowMuted, installContentControls, installNavigationShortcuts, parseInboxList, postMediaSources, threadIdFromPath } from "./dm-monitor";
+import { blockedDestination, classifyThread, inboxEventKind, inboxRowKind, inboxRowMuted, looksLikeStorySeenRequest, installContentControls, installNavigationShortcuts, parseInboxList, postMediaSources, threadIdFromPath } from "./dm-monitor";
 
 function page(header: string, rows: string): Document {
   document.body.innerHTML = `<main><header>${header}</header><section>${rows}</section></main>`;
@@ -328,6 +328,21 @@ describe("navigation shortcuts", () => {
     await Promise.resolve();
 
     expect(actions).toEqual(["fullscreen"]);
+  });
+});
+
+describe("ghost story viewer", () => {
+  it("suppresses seen receipts across the shapes Instagram has used", () => {
+    expect(looksLikeStorySeenRequest("/api/v1/stories/reel/seen/", undefined, "POST")).toBe(true);
+    expect(looksLikeStorySeenRequest("/graphql/query", "fb_api_req_friendly_name=PolarisStoriesV3SeenMutation&x=1", "POST")).toBe(true);
+    expect(looksLikeStorySeenRequest("/graphql/query", "fb_api_req_friendly_name=PolarisStoriesV3ReelSeenMutation", "POST")).toBe(true);
+    expect(looksLikeStorySeenRequest("/api/graphql", "variables={}&doc_id=1&fb_api_req_friendly_name=useMarkSeenMutation", "POST")).toBe(true);
+  });
+
+  it("leaves reads and unrelated writes alone", () => {
+    expect(looksLikeStorySeenRequest("/graphql/query", "fb_api_req_friendly_name=PolarisStoriesV3ReelPageQuery&seen_state=1", "GET")).toBe(false);
+    expect(looksLikeStorySeenRequest("/api/v1/feed/timeline/", "reason=cold_start", "POST")).toBe(false);
+    expect(looksLikeStorySeenRequest("/api/v1/direct_v2/threads/1/items/", "text=hey", "POST")).toBe(false);
   });
 });
 

@@ -676,8 +676,21 @@ async function copyPostImage(article: HTMLElement): Promise<void> {
 export function installPostMediaActions(win: Window): void {
   if (win.__INSTADESK_MEDIA_ACTIONS__) return;
   win.__INSTADESK_MEDIA_ACTIONS__ = true;
+  // Instagram builds many things out of <article>: feed posts, but also the DM
+  // pane, suggestion cards and modal shells. Attaching to all of them scattered
+  // the buttons over unrelated parts of the page and left most of them with no
+  // media to act on, so the element has to prove it is a post first.
+  const isPost = (article: HTMLElement): boolean => {
+    if (article.parentElement?.closest("article")) return false;
+    if (/^\/direct(?:\/|$)|^\/stories(?:\/|$)/.test(win.location?.pathname ?? "")) return false;
+    if (article.getBoundingClientRect().width < 250) return false;
+    return downloadableMedia(article).length > 0;
+  };
   const enhance = () => {
     for (const article of win.document.querySelectorAll<HTMLElement>("article:not([data-instadesk-media-actions])")) {
+      // Not marked as handled: an article can gain its media after first paint,
+      // and it should pick the buttons up on the pass that follows.
+      if (!isPost(article)) continue;
       article.dataset.instadeskMediaActions = "";
       if (win.getComputedStyle(article).position === "static") article.style.setProperty("position", "relative");
       const host = win.document.createElement("div");
@@ -741,12 +754,31 @@ export function installPostMediaActions(win: Window): void {
  * that drift, but it stays a heuristic — a future rename can silently defeat
  * it, the same tradeoff the content-control heuristics above already accept.
  */
-const STORY_SEEN_URL_PATTERN = /stor(y|ies)[_-]?(seen|viewed)|reel[_-]?(media[_-]?)?seen|seen[_-]?stor(y|ies)|media\/seen/i;
-const STORY_SEEN_BODY_PATTERN = /reel[_-]?seen|stor(y|ies)[_-]?seen|seenState|PolarisStoriesV3ReelSeenMutation/i;
+const STORY_SEEN_URL_PATTERN = /stor(y|ies)[_\-/]?(seen|viewed)|reel[_\-/]?(media[_\-/]?)?seen|seen[_\-/]?stor(y|ies)|media\/seen/i;
+// Matches the wording of a seen receipt wherever it appears — path, form body
+// or GraphQL operation name. Instagram has renamed this operation repeatedly
+// (reel_seen, stories_seen, PolarisStoriesV3SeenMutation), so the shapes are
+// matched by their parts rather than by any one spelling.
+const STORY_SEEN_TOKEN = /(reel|stor(y|ies)|media)[_\-/]?(seen|viewed)|(seen|viewed)[_\-/]?(reel|stor(y|ies)|media|state)|mark[_\-/]?(as[_\-/]?)?seen|seen[_\-/]?mutation|seenmutation/i;
 
-function looksLikeStorySeenRequest(url: string, body?: string): boolean {
+/**
+ * A seen receipt is always a write. Restricting the body match to non-GET
+ * requests keeps the queries that *fetch* stories — which mention seen state in
+ * passing — from being suppressed along with the receipts.
+ */
+export function looksLikeStorySeenRequest(url: string, body?: string, method = "GET"): boolean {
   if (STORY_SEEN_URL_PATTERN.test(url)) return true;
-  return Boolean(body && url.includes("/graphql/") && STORY_SEEN_BODY_PATTERN.test(body));
+  if (method.toUpperCase() === "GET") return false;
+  return STORY_SEEN_TOKEN.test(`${url} ${body ?? ""}`);
+}
+
+/** Names the GraphQL operation so a drifted receipt can be identified from the log. */
+function requestOperation(url: string, body?: string): string {
+  const name = body?.match(/fb_api_req_friendly_name=([^&\s]+)/)?.[1]
+    ?? body?.match(/"?operationName"?\s*[:=]\s*"?([A-Za-z0-9_]+)/)?.[1];
+  let path = url;
+  try { path = new URL(url, "https://www.instagram.com").pathname; } catch { /* keep the raw value */ }
+  return name ? `${path} (${name})` : path;
 }
 
 /** Suppresses the network calls that report a story view while leaving media loads untouched. */
@@ -755,15 +787,36 @@ export function installGhostStories(win: Window): void {
   win.__INSTADESK_GHOST__ = true;
   const enabled = () => Boolean(win.__INSTADESK_CONTENT_CONTROLS__?.ghostStories);
 
+  let reports = 0;
+  const report = (label: string, detail: string) => {
+    console.debug(`[InstaDesk] ${label}`, detail);
+    // Capped: this runs on the network path and only the first few requests of
+    // each kind are needed to tell whether a receipt was matched or missed.
+    if (reports++ > 20) return;
+    void win.__TAURI_INTERNALS__?.invoke("report_diagnostic", { label, detail }).catch(() => { /* diagnostics are best effort */ });
+  };
+  // A write that mentions a story or reel but did not match is exactly what a
+  // renamed receipt would look like, so it is worth surfacing rather than
+  // silently letting through.
+  const noteNearMiss = (url: string, body: string | undefined, method: string) => {
+    if (!enabled() || method.toUpperCase() === "GET") return;
+    const haystack = `${url} ${body ?? ""}`;
+    if (/stor(y|ies)|reel/i.test(haystack) && /seen|view|impression/i.test(haystack)) {
+      report("ghost mode let a story write through", requestOperation(url, body));
+    }
+  };
+
   const nativeFetch = win.fetch.bind(win);
   win.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     try {
       const raw = typeof input === "string" || input instanceof URL ? input.toString() : input.url;
       const body = typeof init?.body === "string" ? init.body : undefined;
-      if (enabled() && looksLikeStorySeenRequest(raw, body)) {
-        console.debug("[InstaDesk] ghost mode suppressed a story view receipt");
+      const method = init?.method ?? (typeof input === "object" && "method" in input ? input.method : "GET");
+      if (enabled() && looksLikeStorySeenRequest(raw, body, method)) {
+        report("ghost mode suppressed a story view receipt", requestOperation(raw, body));
         return new Response(null, { status: 204 });
       }
+      noteNearMiss(raw, body, method);
     } catch { /* Fall through to the real request on any inspection failure. */ }
     return nativeFetch(input, init);
   }) as typeof fetch;
@@ -771,15 +824,18 @@ export function installGhostStories(win: Window): void {
   const XHR = (win as unknown as { XMLHttpRequest: typeof XMLHttpRequest }).XMLHttpRequest.prototype as XMLHttpRequest & { __instadeskUrl?: string };
   const nativeOpen = XHR.open;
   const nativeSend = XHR.send;
-  XHR.open = function (this: XMLHttpRequest & { __instadeskUrl?: string }, method: string, url: string | URL, ...rest: unknown[]) {
+  XHR.open = function (this: XMLHttpRequest & { __instadeskUrl?: string; __instadeskMethod?: string }, method: string, url: string | URL, ...rest: unknown[]) {
     this.__instadeskUrl = String(url);
+    this.__instadeskMethod = method;
     return (nativeOpen as (...args: unknown[]) => void).apply(this, [method, url, ...rest]);
   } as typeof XHR.open;
-  XHR.send = function (this: XMLHttpRequest & { __instadeskUrl?: string }, body?: Document | XMLHttpRequestBodyInit | null) {
+  XHR.send = function (this: XMLHttpRequest & { __instadeskUrl?: string; __instadeskMethod?: string }, body?: Document | XMLHttpRequestBodyInit | null) {
     const url = this.__instadeskUrl;
+    const method = this.__instadeskMethod ?? "GET";
     const bodyText = typeof body === "string" ? body : undefined;
-    if (enabled() && url && looksLikeStorySeenRequest(url, bodyText)) {
-      console.debug("[InstaDesk] ghost mode suppressed a story view receipt (xhr)");
+    if (url) noteNearMiss(url, bodyText, method);
+    if (enabled() && url && looksLikeStorySeenRequest(url, bodyText, method)) {
+      report("ghost mode suppressed a story view receipt (xhr)", requestOperation(url, bodyText));
       win.setTimeout(() => {
         Object.defineProperty(this, "readyState", { value: 4, configurable: true });
         Object.defineProperty(this, "status", { value: 204, configurable: true });
@@ -800,8 +856,8 @@ export function installGhostStories(win: Window): void {
     (win.navigator as Navigator).sendBeacon = (url: string | URL, data?: BodyInit | null): boolean => {
       const urlStr = String(url);
       const bodyText = typeof data === "string" ? data : undefined;
-      if (enabled() && looksLikeStorySeenRequest(urlStr, bodyText)) {
-        console.debug("[InstaDesk] ghost mode suppressed a story view receipt (sendBeacon)");
+      if (enabled() && looksLikeStorySeenRequest(urlStr, bodyText, "POST")) {
+        report("ghost mode suppressed a story view receipt (sendBeacon)", requestOperation(urlStr, bodyText));
         return true; // pretend delivery succeeded
       }
       return nativeSendBeacon(url, data);
