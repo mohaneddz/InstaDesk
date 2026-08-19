@@ -28,6 +28,15 @@ const TITLEBAR_HEIGHT: f64 = 38.0;
 struct Settings {
     notify_private: bool,
     notify_group: bool,
+    notify_messages: bool,
+    notify_reactions: bool,
+    notify_typing: bool,
+    notify_story_replies: bool,
+    notify_note_replies: bool,
+    notify_muted_chats: bool,
+    /// "off", "whitelist" or "blacklist" — how sender_filter_list is read.
+    sender_filter_mode: String,
+    sender_filter_list: Vec<String>,
     launch_at_startup: bool,
     minimize_to_tray: bool,
     notification_previews: bool,
@@ -48,6 +57,14 @@ impl Default for Settings {
         Self {
             notify_private: true,
             notify_group: true,
+            notify_messages: true,
+            notify_reactions: true,
+            notify_typing: false,
+            notify_story_replies: true,
+            notify_note_replies: true,
+            notify_muted_chats: false,
+            sender_filter_mode: "off".into(),
+            sender_filter_list: Vec::new(),
             launch_at_startup: false,
             minimize_to_tray: true,
             notification_previews: true,
@@ -109,6 +126,14 @@ struct InboxMessage {
     preview: String,
     message_key: String,
     kind: String,
+    #[serde(default = "default_event")]
+    event: String,
+    #[serde(default)]
+    muted: bool,
+}
+
+fn default_event() -> String {
+    "message".into()
 }
 
 struct AppState {
@@ -484,6 +509,39 @@ fn dispatch_notification<R: Runtime>(
     result
 }
 
+/// Each kind of inbox event carries its own toggle, so a reaction or a typing
+/// indicator can be silenced without silencing real messages.
+fn event_allowed(settings: &Settings, event: &str) -> bool {
+    match event {
+        "reaction" => settings.notify_reactions,
+        "typing" => settings.notify_typing,
+        "storyReply" => settings.notify_story_replies,
+        "noteReply" => settings.notify_note_replies,
+        _ => settings.notify_messages,
+    }
+}
+
+/// Compares against the sender's display name case-insensitively, and matches a
+/// leading "@" either way so a list written as @name behaves the same as name.
+fn sender_allowed(settings: &Settings, sender: &str) -> bool {
+    let normalize = |value: &str| value.trim().trim_start_matches('@').to_lowercase();
+    let sender = normalize(sender);
+    // An empty list means the filter was switched on but never filled in;
+    // treating that as "allow nothing" would silently swallow every message.
+    if settings.sender_filter_list.iter().all(|entry| entry.trim().is_empty()) {
+        return true;
+    }
+    let listed = settings
+        .sender_filter_list
+        .iter()
+        .any(|entry| !entry.trim().is_empty() && normalize(entry) == sender);
+    match settings.sender_filter_mode.as_str() {
+        "whitelist" => listed,
+        "blacklist" => !listed,
+        _ => true,
+    }
+}
+
 /// The inbox WebView is parked offscreen where devtools cannot reach it, so it
 /// reports what its scans found through here and the output lands in the
 /// terminal alongside the rest of the app's logging.
@@ -534,7 +592,13 @@ fn incoming_message(app: AppHandle, webview: Webview, message: InboxMessage) -> 
     } else {
         settings.notify_private
     };
-    if hidden || !allowed {
+    if hidden || !allowed || !event_allowed(&settings, &message.event) {
+        return Ok(());
+    }
+    if message.muted && !settings.notify_muted_chats {
+        return Ok(());
+    }
+    if !sender_allowed(&settings, &message.sender) {
         return Ok(());
     }
     let key = format!("{}:{}", message.conversation_id, message.message_key);
