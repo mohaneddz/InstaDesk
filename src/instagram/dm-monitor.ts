@@ -291,8 +291,13 @@ function rowConversationId(row: Element): string | null {
 export function inboxRowElements(document: Document): HTMLElement[] {
   const anchors = [...document.querySelectorAll<HTMLElement>('a[href*="/direct/t/"]')];
   if (anchors.length) return anchors;
+  // The fallback matches on role alone, which the feed also uses — posts and
+  // comment rows look just like conversation rows to it. It is only trustworthy
+  // on the inbox itself, where every such row is a conversation.
+  if (!/^\/direct(?:\/|$)/.test(document.location?.pathname ?? "")) return [];
   const candidates = [...document.querySelectorAll<HTMLElement>('[role="listitem"], [role="row"], [role="button"][tabindex="0"]')]
-    .filter((element) => Boolean(element.querySelector("img")) && normalizedText(element).length > 1);
+    .filter((element) => Boolean(element.querySelector("img")) && normalizedText(element).length > 1)
+    .filter((element) => !element.closest('article, [role="article"], [role="dialog"]'));
   // Rows nest inside one another in the fallback markup; keep the innermost.
   return candidates.filter((element) => !candidates.some((other) => other !== element && element.contains(other)));
 }

@@ -257,7 +257,8 @@
   function inboxRowElements(document2) {
     const anchors = [...document2.querySelectorAll('a[href*="/direct/t/"]')];
     if (anchors.length) return anchors;
-    const candidates = [...document2.querySelectorAll('[role="listitem"], [role="row"], [role="button"][tabindex="0"]')].filter((element) => Boolean(element.querySelector("img")) && normalizedText(element).length > 1);
+    if (!/^\/direct(?:\/|$)/.test(document2.location?.pathname ?? "")) return [];
+    const candidates = [...document2.querySelectorAll('[role="listitem"], [role="row"], [role="button"][tabindex="0"]')].filter((element) => Boolean(element.querySelector("img")) && normalizedText(element).length > 1).filter((element) => !element.closest('article, [role="article"], [role="dialog"]'));
     return candidates.filter((element) => !candidates.some((other) => other !== element && element.contains(other)));
   }
   function parseInboxList(document2, origin = "https://www.instagram.com") {

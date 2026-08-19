@@ -53,12 +53,21 @@ describe("inbox list parser", () => {
   });
 
   it("parses rows that carry no thread anchor", () => {
+    history.replaceState({}, "", "/direct/inbox/");
     const doc = inboxPage(`<div role="list">
       <div role="listitem"><img alt="Sarah's profile picture" src="/a.jpg"><div><span>Sarah</span></div><div><span>bro look at this</span></div></div>
     </div>`);
     const [item] = parseInboxList(doc);
     expect(item).toMatchObject({ sender: "Sarah", preview: "bro look at this", kind: "private" });
     expect(item.conversationUrl).toBe("https://www.instagram.com/direct/inbox/");
+  });
+
+  it("ignores anchor-less rows outside the inbox, where the feed uses the same roles", () => {
+    history.replaceState({}, "", "/");
+    const doc = inboxPage(`<article role="article">
+      <div role="button" tabindex="0"><img alt="poster" src="/a.jpg"><span>I gooned</span><span>449 likes Reply</span></div>
+    </article>`);
+    expect(parseInboxList(doc)).toEqual([]);
   });
 
   it("classifies a group thread from comma-separated usernames in row title", () => {
@@ -192,6 +201,7 @@ describe("content controls", () => {
     expect(document.querySelector<HTMLElement>("#group")!.style.display).toBe("none");
   });
   it("removes anchor-less rows and Instagram's unread badge", async () => {
+    history.replaceState({}, "", "/direct/inbox/");
     document.body.innerHTML = `<nav><a href="/direct/inbox/"><span><span>2</span></span></a></nav>
     <main><div role="list">
       <div role="listitem" id="row"><img alt="Sarah's profile picture" src="/a.jpg"><span>Sarah</span><span>hey</span></div>
