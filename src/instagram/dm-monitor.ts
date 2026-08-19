@@ -305,36 +305,23 @@ function nativeAction(win: Window, action: string): void {
 }
 
 /**
- * Keeps F11 owned by the shell before Instagram handles the key event, and
- * captures Left Alt + Right Alt inside the WebView to toggle the window.
+ * Keeps F11 owned by the shell before Instagram handles the key event.
+ *
+ * Left Alt + Right Alt is deliberately NOT handled here: the native low-level
+ * keyboard hook already sees that chord globally. Handling it in the page too
+ * fired the toggle twice whenever the WebView had focus — hide immediately
+ * followed by show, which looked like the shortcut doing nothing.
  */
 export function installNavigationShortcuts(win: Window): void {
   if (win.__INSTADESK_SHORTCUTS__) return;
   win.__INSTADESK_SHORTCUTS__ = true;
-  let leftAlt = false;
-  let rightAlt = false;
-  let toggleFired = false;
 
   win.addEventListener("keydown", (event) => {
     if (event.key === "F11") {
       event.preventDefault();
       event.stopImmediatePropagation();
       nativeAction(win, "fullscreen");
-      return;
     }
-    if (event.code === "AltLeft") leftAlt = true;
-    if (event.code === "AltRight") rightAlt = true;
-    if (leftAlt && rightAlt && !toggleFired) {
-      toggleFired = true;
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      nativeAction(win, "toggle_window");
-    }
-  }, true);
-
-  win.addEventListener("keyup", (event) => {
-    if (event.code === "AltLeft") { leftAlt = false; toggleFired = false; }
-    if (event.code === "AltRight") { rightAlt = false; toggleFired = false; }
   }, true);
 }
 
