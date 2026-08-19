@@ -287,6 +287,18 @@ function rowConversationId(row: Element): string | null {
  * because they carry the thread id; the role-based rows are the fallback that
  * keeps hiding and detection working on the builds that lack them.
  */
+function hasTimestamp(row: Element): boolean {
+  if (TIMESTAMP_SUFFIX.test(normalizedText(row))) return true;
+  return [...row.querySelectorAll("span, div, time, abbr")]
+    .some((element) => element.children.length === 0 && TIME_ONLY.test(normalizedText(element)));
+}
+
+/** Reports how rows were found, so a bad notification can be traced to its source. */
+export function inboxRowSource(document: Document): "anchor" | "fallback" | "none" {
+  if (document.querySelector('a[href*="/direct/t/"]')) return "anchor";
+  return inboxRowElements(document).length ? "fallback" : "none";
+}
+
 export function inboxRowElements(document: Document): HTMLElement[] {
   const anchors = [...document.querySelectorAll<HTMLElement>('a[href*="/direct/t/"]')];
   if (anchors.length) return anchors;
@@ -296,7 +308,11 @@ export function inboxRowElements(document: Document): HTMLElement[] {
   if (!/^\/direct(?:\/|$)/.test(document.location?.pathname ?? "")) return [];
   const candidates = [...document.querySelectorAll<HTMLElement>('[role="listitem"], [role="row"], [role="button"][tabindex="0"]')]
     .filter((element) => Boolean(element.querySelector("img")) && normalizedText(element).length > 1)
-    .filter((element) => !element.closest('article, [role="article"], [role="dialog"]'));
+    .filter((element) => !element.closest('article, [role="article"], [role="dialog"]'))
+    // Every conversation row carries the time of its last message. The notes
+    // and story tray above the list does not, and its avatar-plus-a-line shape
+    // is otherwise indistinguishable from a conversation.
+    .filter(hasTimestamp);
   // Rows nest inside one another in the fallback markup; keep the innermost.
   return candidates.filter((element) => !candidates.some((other) => other !== element && element.contains(other)));
 }
@@ -1087,7 +1103,7 @@ export function installInboxMonitor(win: Window): void {
       for (const item of candidates) {
         if (seen.get(item.conversationId) === item.messageKey) continue;
         seen.set(item.conversationId, item.messageKey);
-        report("incoming message detected", `${item.kind} ${item.event}${item.muted ? " (muted)" : ""} from ${item.sender}`);
+        report("incoming message detected", `${item.kind} ${item.event}${item.muted ? " (muted)" : ""} from ${item.sender} via ${inboxRowSource(win.document)} on ${win.location.pathname}`);
         void win.__TAURI_INTERNALS__?.invoke("incoming_message", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
       }
     } catch (error) { console.warn("[InstaDesk] inbox parsing failure", error); }

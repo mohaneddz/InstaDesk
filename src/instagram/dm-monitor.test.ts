@@ -55,11 +55,20 @@ describe("inbox list parser", () => {
   it("parses rows that carry no thread anchor", () => {
     history.replaceState({}, "", "/direct/inbox/");
     const doc = inboxPage(`<div role="list">
-      <div role="listitem"><img alt="Sarah's profile picture" src="/a.jpg"><div><span>Sarah</span></div><div><span>bro look at this</span></div></div>
+      <div role="listitem"><img alt="Sarah's profile picture" src="/a.jpg"><div><span>Sarah</span></div><div><span>bro look at this</span><span> · </span><span>1m</span></div></div>
     </div>`);
     const [item] = parseInboxList(doc);
     expect(item).toMatchObject({ sender: "Sarah", preview: "bro look at this", kind: "private" });
     expect(item.conversationUrl).toBe("https://www.instagram.com/direct/inbox/");
+  });
+
+  it("ignores the notes and story tray above the conversation list", () => {
+    history.replaceState({}, "", "/direct/inbox/");
+    const doc = inboxPage(`<div role="list">
+      <div role="button" tabindex="0"><img alt="profile picture of rasputin964" src="/a.jpg"><span>rasputin964</span><span>Clip</span></div>
+      <div role="listitem"><img alt="profile picture of Sarah" src="/b.jpg"><span>Sarah</span><span>hey</span><span>2h</span></div>
+    </div>`);
+    expect(parseInboxList(doc).map((item) => item.sender)).toEqual(["Sarah"]);
   });
 
   it("ignores anchor-less rows outside the inbox, where the feed uses the same roles", () => {
@@ -204,7 +213,7 @@ describe("content controls", () => {
     history.replaceState({}, "", "/direct/inbox/");
     document.body.innerHTML = `<nav><a href="/direct/inbox/"><span><span>2</span></span></a></nav>
     <main><div role="list">
-      <div role="listitem" id="row"><img alt="Sarah's profile picture" src="/a.jpg"><span>Sarah</span><span>hey</span></div>
+      <div role="listitem" id="row"><img alt="Sarah's profile picture" src="/a.jpg"><span>Sarah</span><span>hey</span><span>1m</span></div>
     </div></main>`;
     const hideControls = { ...controls, hidePrivateChats: true, hideGroupChats: true };
     window.__INSTADESK_CONTENT_CONTROLS__ = hideControls;

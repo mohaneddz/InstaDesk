@@ -249,11 +249,19 @@
     const title = inboxRowTitle(row);
     return title && title !== "Instagram" ? `title-${stableHash(title)}` : null;
   }
+  function hasTimestamp(row) {
+    if (TIMESTAMP_SUFFIX.test(normalizedText(row))) return true;
+    return [...row.querySelectorAll("span, div, time, abbr")].some((element) => element.children.length === 0 && TIME_ONLY.test(normalizedText(element)));
+  }
+  function inboxRowSource(document2) {
+    if (document2.querySelector('a[href*="/direct/t/"]')) return "anchor";
+    return inboxRowElements(document2).length ? "fallback" : "none";
+  }
   function inboxRowElements(document2) {
     const anchors = [...document2.querySelectorAll('a[href*="/direct/t/"]')];
     if (anchors.length) return anchors;
     if (!/^\/direct(?:\/|$)/.test(document2.location?.pathname ?? "")) return [];
-    const candidates = [...document2.querySelectorAll('[role="listitem"], [role="row"], [role="button"][tabindex="0"]')].filter((element) => Boolean(element.querySelector("img")) && normalizedText(element).length > 1).filter((element) => !element.closest('article, [role="article"], [role="dialog"]'));
+    const candidates = [...document2.querySelectorAll('[role="listitem"], [role="row"], [role="button"][tabindex="0"]')].filter((element) => Boolean(element.querySelector("img")) && normalizedText(element).length > 1).filter((element) => !element.closest('article, [role="article"], [role="dialog"]')).filter(hasTimestamp);
     return candidates.filter((element) => !candidates.some((other) => other !== element && element.contains(other)));
   }
   function parseInboxList(document2, origin = "https://www.instagram.com") {
@@ -907,7 +915,7 @@
         for (const item of candidates) {
           if (seen.get(item.conversationId) === item.messageKey) continue;
           seen.set(item.conversationId, item.messageKey);
-          report("incoming message detected", `${item.kind} ${item.event}${item.muted ? " (muted)" : ""} from ${item.sender}`);
+          report("incoming message detected", `${item.kind} ${item.event}${item.muted ? " (muted)" : ""} from ${item.sender} via ${inboxRowSource(win.document)} on ${win.location.pathname}`);
           void win.__TAURI_INTERNALS__?.invoke("incoming_message", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
         }
       } catch (error) {
