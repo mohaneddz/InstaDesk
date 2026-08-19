@@ -36,6 +36,7 @@ const THREAD_RE = /(?:^|\/)direct\/t\/([^/?#]+)\/?/;
 const GROUP_WORDS = /\b(group|members?|participants?|people)\b/i;
 const OWN_WORDS = /^\s*you\s*(?::|\b(?:sent|reacted|shared|replied|called|unsent)\b)/i;
 const TIMESTAMP_SUFFIX = /\s*·\s*(?:now|just now|\d+\s*[smhdw]|yesterday|\d+\s*(?:sec|min|hour|hr|day|week)s?(?:\s+ago)?)\s*$/i;
+const PROFILE_PICTURE_RE = /profile picture|avatar/i;
 const PROFILE_RE = /^\/(?!direct(?:\/|$)|explore(?:\/|$)|reels?(?:\/|$)|accounts(?:\/|$)|p(?:\/|$))([A-Za-z0-9._]+)\/?$/;
 
 function normalizedText(node: Element | null): string {
@@ -97,9 +98,11 @@ export function classifyThread(document: Document): { kind: "private"; peer: str
     if (alt.includes(",") || /\band\b/i.test(alt) || GROUP_WORDS.test(alt)) return { kind: "group" };
   }
 
-  // Multiple avatars in header
-  if (header.querySelectorAll("img").length >= 2) return { kind: "group" };
-
+  // Stacked participant avatars. Counting every <img> is not enough evidence:
+  // a header carries badges and icons alongside the people in the thread.
+  if ([...header.querySelectorAll<HTMLImageElement>("img")].filter((image) => PROFILE_PICTURE_RE.test(image.alt || "")).length >= 2) {
+    return { kind: "group" };
+  }
   // Comma-separated names in header title
   const headerTitles = [...header.querySelectorAll("h1, h2, h3, h4, span, div")]
     .filter((el) => el.children.length === 0)
@@ -145,7 +148,7 @@ export interface InboxCandidate {
   sender: string;
   preview: string;
   messageKey: string;
-  kind: "private" | "group";
+  kind: "private" | "group" | "unknown";
   event: InboxEvent;
   muted: boolean;
 }
@@ -222,38 +225,34 @@ export function inboxRowPreview(row: Element): string {
 }
 
 /** Determines if the row represents a 1:1 chat or group chat. */
-export function inboxRowKind(row: Element): "private" | "group" {
-  const ariaLabel = row.getAttribute("aria-label") ?? row.querySelector("[aria-label]")?.getAttribute("aria-label") ?? "";
-  const text = `${ariaLabel} ${normalizedText(row)}`;
+export function inboxRowKind(row: Element): "private" | "group" | "unknown" {
+  // Only the row's own label is trusted for wording: the preview is message
+  // text, and a message that happens to mention a group or people is not
+  // evidence of anything.
+  const ariaLabel = row.getAttribute("aria-label") ?? "";
+  if (GROUP_WORDS.test(ariaLabel)) return "group";
+  if (ariaLabel.split(",").length >= 2) return "group";
 
-  if (GROUP_WORDS.test(text)) return "group";
-  if (/group/i.test(row.className || "")) return "group";
-
-  // Check if title or aria-label contains comma-separated names
   const title = inboxRowTitle(row);
-  if (title.includes(",") && title.split(",").length >= 2) return "group";
-  if (ariaLabel.includes(",") && ariaLabel.split(",").length >= 2) return "group";
+  if (title.split(",").length >= 2) return "group";
 
-  // Check if image alt text indicates multiple people
-  for (const img of row.querySelectorAll<HTMLImageElement>("img[alt]")) {
-    const alt = img.alt || "";
-    if (alt.includes(",") || /\band\b/i.test(alt) || GROUP_WORDS.test(alt)) return "group";
-  }
+  // Instagram renders one profile picture per participant, so stacked avatars
+  // are the reliable signal. Counting every <img> is not: verified badges,
+  // reaction thumbnails and story rings all put extra images in the row.
+  const avatars = [...row.querySelectorAll<HTMLImageElement>("img")]
+    .filter((image) => PROFILE_PICTURE_RE.test(image.alt || ""));
+  if (avatars.length >= 2) return "group";
+  if (avatars.some((image) => image.alt.includes(",") || /\band\b/i.test(image.alt))) return "group";
 
-  // Multiple avatars or stacked avatar elements
-  const avatars = row.querySelectorAll("img").length;
-  if (avatars >= 2) return "group";
-
-  const stackedOrGroupIndicators = row.querySelectorAll('canvas, svg, [class*="group" i], [aria-label*="group" i]');
-  if (stackedOrGroupIndicators.length >= 2) return "group";
-
-  // In Instagram group chats, incoming message previews are prefixed with "<SenderName>: <message>"
+  // Group previews are prefixed with the member who spoke: "Sarah: hey".
   const preview = inboxRowPreview(row);
-  if (/^[A-Za-z0-9._\s]+:\s+\S+/.test(preview) && !OWN_WORDS.test(preview)) {
-    return "group";
-  }
+  const prefix = preview.match(/^([^:]{1,25}):\s+\S/);
+  if (prefix && !OWN_WORDS.test(preview) && prefix[1].trim() !== title) return "group";
 
-  return "private";
+  // A single identified participant is the only positive evidence of a 1:1
+  // chat. Without it the row stays unknown rather than being guessed at, so a
+  // single-category hide can never take out the whole inbox.
+  return avatars.length === 1 ? "private" : "unknown";
 }
 
 /** A row's own last-sent message is prefixed "You: ..." or "You sent ...". */

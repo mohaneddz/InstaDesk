@@ -41,13 +41,13 @@ describe("inbox list parser", () => {
   }
 
   it("extracts a private conversation candidate with sender and preview", () => {
-    const doc = inboxPage('<a href="/direct/t/123/"><span>Sarah</span> bro look at this<img src="/a.jpg"></a>');
+    const doc = inboxPage('<a href="/direct/t/123/"><span>Sarah</span> bro look at this<img alt="profile picture of Sarah" src="/a.jpg"></a>');
     const [item] = parseInboxList(doc);
     expect(item).toMatchObject({ conversationId: "123", sender: "Sarah", preview: "bro look at this", kind: "private" });
   });
 
   it("extracts candidates from absolute instagram conversation URLs", () => {
-    const doc = inboxPage('<a href="https://www.instagram.com/direct/t/999/"><span>Mike</span> test message<img src="/a.jpg"></a>');
+    const doc = inboxPage('<a href="https://www.instagram.com/direct/t/999/"><span>Mike</span> test message<img alt="profile picture of Mike" src="/a.jpg"></a>');
     const [item] = parseInboxList(doc);
     expect(item).toMatchObject({ conversationId: "999", sender: "Mike", preview: "test message", kind: "private" });
   });
@@ -172,8 +172,8 @@ describe("content controls", () => {
   });
   it("hides private inbox rows while leaving group rows visible", async () => {
     document.body.innerHTML = `<main>
-      <a id="private" href="/direct/t/123/"><span>Sarah</span>Sarah hey<img src="/a.jpg"></a>
-      <a id="group" href="/direct/t/456/"><span>Trip</span>Trip see you<img src="/a.jpg"><img src="/b.jpg"></a>
+      <a id="private" href="/direct/t/123/"><span>Sarah</span>Sarah hey<img alt="Sarah's profile picture" src="/a.jpg"></a>
+      <a id="group" href="/direct/t/456/"><span>Trip</span>Trip see you<img alt="Ann's profile picture" src="/a.jpg"><img alt="Bo's profile picture" src="/b.jpg"></a>
     </main>`;
     const hideControls = { ...controls, hidePrivateChats: true, hideGroupChats: false };
     window.__INSTADESK_CONTENT_CONTROLS__ = hideControls;
@@ -187,8 +187,8 @@ describe("content controls", () => {
   });
   it("hides group inbox rows while leaving private rows visible", async () => {
     document.body.innerHTML = `<main>
-      <a id="private" href="/direct/t/123/"><span>Sarah</span>Sarah hey<img src="/a.jpg"></a>
-      <a id="group" href="/direct/t/456/"><span>Alice, Bob</span>Alice, Bob see you<img src="/a.jpg"></a>
+      <a id="private" href="/direct/t/123/"><span>Sarah</span>Sarah hey<img alt="Sarah's profile picture" src="/a.jpg"></a>
+      <a id="group" href="/direct/t/456/"><span>Alice, Bob</span>Alice, Bob see you<img alt="Alice's profile picture" src="/a.jpg"></a>
     </main>`;
     const hideControls = { ...controls, hidePrivateChats: false, hideGroupChats: true };
     window.__INSTADESK_CONTENT_CONTROLS__ = hideControls;
@@ -216,6 +216,21 @@ describe("content controls", () => {
     expect(document.querySelector<HTMLElement>("#row")!.style.display).toBe("none");
     expect(document.querySelector<HTMLElement>("nav a span")!.style.display).toBe("none");
     expect(document.querySelector<HTMLElement>('[role="list"]')!.style.display).not.toBe("none");
+  });
+  it("leaves unclassifiable rows alone when only one category is hidden", async () => {
+    document.body.innerHTML = `<main>
+      <a id="unknown" href="/direct/t/1/"><img src="/a.jpg"><span>Sarah</span><span>hey</span></a>
+      <a id="private" href="/direct/t/2/"><img alt="profile picture of Mike" src="/b.jpg"><span>Mike</span><span>hey</span></a>
+    </main>`;
+    const hideControls = { ...controls, hidePrivateChats: true, hideGroupChats: false };
+    window.__INSTADESK_CONTENT_CONTROLS__ = hideControls;
+    window.__TAURI_INTERNALS__ = { invoke: async () => hideControls };
+    delete window.__INSTADESK_CONTROLS__;
+    installContentControls(window);
+    await Promise.resolve();
+
+    expect(document.querySelector<HTMLElement>("#private")!.style.display).toBe("none");
+    expect(document.querySelector<HTMLElement>("#unknown")!.style.display).not.toBe("none");
   });
   it("prevents clicking on hidden conversation links", async () => {
     document.body.innerHTML = `<main>
@@ -245,6 +260,29 @@ describe("content controls", () => {
     expect(item.sender).toBe("Alice, Bob, Charlie");
     expect(item.preview).toBe("Hey all");
     expect(item.kind).toBe("group");
+  });
+});
+
+describe("inbox row classifier", () => {
+  it("keeps a 1:1 row private despite story rings, badges and icons", () => {
+    document.body.innerHTML = `<main><a href="/direct/t/1/">
+      <canvas></canvas><img alt="profile picture of Sarah" src="/a.jpg">
+      <svg aria-label="Verified"></svg><svg aria-label="Seen"></svg>
+      <span>Sarah</span><span>see you there</span>
+    </a></main>`;
+    expect(inboxRowKind(document.querySelector("a")!)).toBe("private");
+  });
+
+  it("does not read group wording out of the message text", () => {
+    document.body.innerHTML = `<main><a href="/direct/t/1/">
+      <img alt="profile picture of Sarah" src="/a.jpg"><span>Sarah</span><span>are people coming to the group thing</span>
+    </a></main>`;
+    expect(inboxRowKind(document.querySelector("a")!)).toBe("private");
+  });
+
+  it("reports unknown when nothing identifies the participants", () => {
+    document.body.innerHTML = '<main><a href="/direct/t/1/"><img src="/a.jpg"><span>Sarah</span><span>hey</span></a></main>';
+    expect(inboxRowKind(document.querySelector("a")!)).toBe("unknown");
   });
 });
 

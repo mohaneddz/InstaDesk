@@ -97,6 +97,7 @@
   var GROUP_WORDS = /\b(group|members?|participants?|people)\b/i;
   var OWN_WORDS = /^\s*you\s*(?::|\b(?:sent|reacted|shared|replied|called|unsent)\b)/i;
   var TIMESTAMP_SUFFIX = /\s*·\s*(?:now|just now|\d+\s*[smhdw]|yesterday|\d+\s*(?:sec|min|hour|hr|day|week)s?(?:\s+ago)?)\s*$/i;
+  var PROFILE_PICTURE_RE = /profile picture|avatar/i;
   var PROFILE_RE = /^\/(?!direct(?:\/|$)|explore(?:\/|$)|reels?(?:\/|$)|accounts(?:\/|$)|p(?:\/|$))([A-Za-z0-9._]+)\/?$/;
   function normalizedText(node) {
     return (node?.textContent ?? "").replace(/\s+/g, " ").trim();
@@ -138,7 +139,9 @@
       const alt = img.alt || "";
       if (alt.includes(",") || /\band\b/i.test(alt) || GROUP_WORDS.test(alt)) return { kind: "group" };
     }
-    if (header.querySelectorAll("img").length >= 2) return { kind: "group" };
+    if ([...header.querySelectorAll("img")].filter((image) => PROFILE_PICTURE_RE.test(image.alt || "")).length >= 2) {
+      return { kind: "group" };
+    }
     const headerTitles = [...header.querySelectorAll("h1, h2, h3, h4, span, div")].filter((el) => el.children.length === 0).map((el) => normalizedText(el)).filter((t) => t.length > 0 && t.length < 100 && !TIME_ONLY.test(t));
     for (const title of headerTitles) {
       if (title.includes(",") && title.split(",").length >= 2) {
@@ -218,26 +221,18 @@
     return preview.slice(0, 240);
   }
   function inboxRowKind(row) {
-    const ariaLabel = row.getAttribute("aria-label") ?? row.querySelector("[aria-label]")?.getAttribute("aria-label") ?? "";
-    const text = `${ariaLabel} ${normalizedText(row)}`;
-    if (GROUP_WORDS.test(text)) return "group";
-    if (/group/i.test(row.className || "")) return "group";
+    const ariaLabel = row.getAttribute("aria-label") ?? "";
+    if (GROUP_WORDS.test(ariaLabel)) return "group";
+    if (ariaLabel.split(",").length >= 2) return "group";
     const title = inboxRowTitle(row);
-    if (title.includes(",") && title.split(",").length >= 2) return "group";
-    if (ariaLabel.includes(",") && ariaLabel.split(",").length >= 2) return "group";
-    for (const img of row.querySelectorAll("img[alt]")) {
-      const alt = img.alt || "";
-      if (alt.includes(",") || /\band\b/i.test(alt) || GROUP_WORDS.test(alt)) return "group";
-    }
-    const avatars = row.querySelectorAll("img").length;
-    if (avatars >= 2) return "group";
-    const stackedOrGroupIndicators = row.querySelectorAll('canvas, svg, [class*="group" i], [aria-label*="group" i]');
-    if (stackedOrGroupIndicators.length >= 2) return "group";
+    if (title.split(",").length >= 2) return "group";
+    const avatars = [...row.querySelectorAll("img")].filter((image) => PROFILE_PICTURE_RE.test(image.alt || ""));
+    if (avatars.length >= 2) return "group";
+    if (avatars.some((image) => image.alt.includes(",") || /\band\b/i.test(image.alt))) return "group";
     const preview = inboxRowPreview(row);
-    if (/^[A-Za-z0-9._\s]+:\s+\S+/.test(preview) && !OWN_WORDS.test(preview)) {
-      return "group";
-    }
-    return "private";
+    const prefix = preview.match(/^([^:]{1,25}):\s+\S/);
+    if (prefix && !OWN_WORDS.test(preview) && prefix[1].trim() !== title) return "group";
+    return avatars.length === 1 ? "private" : "unknown";
   }
   function isOwnLastMessage(row, preview) {
     const ariaLabel = row.getAttribute("aria-label") ?? "";
