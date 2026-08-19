@@ -55,10 +55,9 @@ app.innerHTML = `
       <label><span><b>Hide group chats</b><small>Hide group conversations from the inbox list and block opening them.</small></span><input id="hideGroupChats" type="checkbox"><i></i></label>
     </div>
     <section class="shortcuts" aria-labelledby="shortcuts-title">
-      <div class="shortcuts-copy"><b id="shortcuts-title">Navigation shortcuts</b><small>Move through your Instagram history.</small></div>
+      <div class="shortcuts-copy"><b id="shortcuts-title">Keyboard shortcuts</b><small>Quickly show or hide InstaDesk.</small></div>
       <div class="shortcut-list">
-        <div class="shortcut-row"><span>Toggle app</span><span class="keys"><kbd>Left Alt</kbd><em>+</em><kbd>Right Alt</kbd></span></div>
-        <div class="shortcut-row"><span>Back / forward, then hide</span><span class="keys"><kbd>Alt</kbd><em>+</em><kbd>←</kbd><em>/</em><kbd>→</kbd></span></div>
+        <div class="shortcut-row"><span>Toggle app</span><span class="keys"><kbd>Ctrl</kbd><em>+</em><kbd>Alt</kbd><em>+</em><kbd>I</kbd></span></div>
       </div>
       <p class="global-note">Toggle app is available globally, including while InstaDesk is hidden.</p>
     </section>
@@ -72,7 +71,10 @@ const keys: (keyof Settings)[] = [
   "disablePosts", "disableStories", "disableSuggestions", "ghostStories",
   "hidePrivateChats", "hideGroupChats"
 ];
-let current: Settings;
+// Initialized to undefined until load() resolves; the change handler guards
+// against the (practically impossible but architecturally possible) case where
+// a toggle event fires before the first IPC round-trip completes.
+let current: Settings | undefined;
 void invoke("settings_ui_ready");
 
 async function load(): Promise<void> {
@@ -82,11 +84,16 @@ async function load(): Promise<void> {
 
 for (const key of keys) {
   document.querySelector<HTMLInputElement>(`#${key}`)!.addEventListener("change", async (event) => {
+    if (!current) return; // load() hasn't resolved yet — ignore the premature event
     current[key] = (event.currentTarget as HTMLInputElement).checked;
     status.textContent = "Saving…";
     try {
       current = await invoke<Settings>("update_settings", { settings: current });
       status.textContent = "Saved";
+      // Reset the status message after a short delay so it doesn't stick forever.
+      setTimeout(() => {
+        if (status.textContent === "Saved") status.textContent = "Settings save automatically";
+      }, 2000);
     } catch (error) {
       status.textContent = `Could not save: ${String(error)}`;
       await load();
@@ -98,6 +105,11 @@ document.querySelector(".close")!.addEventListener("click", () => void invoke("w
 document.querySelector(".titlebar")!.addEventListener("pointerdown", (event) => {
   if ((event.target as Element).closest("button")) return;
   void invoke("window_action", { action: "drag_settings" });
+});
+
+window.addEventListener("focus", () => { void load(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void load();
 });
 
 void load().catch((error) => { status.textContent = `Could not load settings: ${String(error)}`; });

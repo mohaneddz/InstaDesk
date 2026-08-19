@@ -29,9 +29,8 @@ document.querySelectorAll<HTMLElement>("[data-action]").forEach((element) => {
   element.addEventListener(eventName, () => void invoke("window_action", { action }));
 });
 
-// Left Alt + Right Alt is owned by the native keyboard hook, which sees the
-// chord whether or not the app has focus. Toggling from here as well fired it
-// twice while focused, hiding and immediately reshowing the window.
+// The window toggle is a global shortcut registered natively, which the OS
+// delivers regardless of focus; handling it here too would toggle twice.
 window.addEventListener("keydown", (event) => {
   if (event.key === "F11") {
     event.preventDefault();

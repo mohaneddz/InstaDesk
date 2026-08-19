@@ -1,9 +1,5 @@
 use serde::{Deserialize, Serialize};
-// AtomicBool and Ordering are used both by the Windows keyboard hook and by
-// AppState::quitting, so import them unconditionally.
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(windows)]
-use std::sync::{mpsc, OnceLock};
 use std::{
     collections::{HashSet, VecDeque},
     fs,
@@ -17,6 +13,7 @@ use tauri::{
     WebviewUrl, WebviewWindowBuilder, Window, WindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 use tauri_plugin_notification::NotificationExt;
 
 const INSTAGRAM_HOME: &str = "https://www.instagram.com/";
@@ -25,14 +22,6 @@ const SETTINGS_FILE: &str = "settings.json";
 const MAX_DEDUP: usize = 1000;
 const TITLEBAR_HEIGHT: f64 = 38.0;
 
-#[cfg(windows)]
-static ALT_TOGGLE_SENDER: OnceLock<mpsc::Sender<()>> = OnceLock::new();
-#[cfg(windows)]
-static LEFT_ALT_DOWN: AtomicBool = AtomicBool::new(false);
-#[cfg(windows)]
-static RIGHT_ALT_DOWN: AtomicBool = AtomicBool::new(false);
-#[cfg(windows)]
-static ALT_TOGGLE_FIRED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -195,6 +184,38 @@ fn hide_main_window<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
     }
 }
 
+/// Ctrl + Alt + I toggles the window from anywhere.
+///
+/// The previous binding watched for Left Alt + Right Alt through a low-level
+/// keyboard hook. A bare modifier chord is a poor shortcut: Windows and the
+/// page both act on Alt on their own, and nothing downstream can tell the
+/// chord apart from someone simply holding Alt. A registered shortcut with a
+/// non-modifier key is delivered by the OS and does not depend on focus.
+pub const TOGGLE_SHORTCUT: &str = "Ctrl+Alt+I";
+
+fn install_toggle_shortcut<R: Runtime>(app: &AppHandle<R>) {
+    use tauri_plugin_global_shortcut::ShortcutState;
+
+    let handle = app.clone();
+    let registered = app.plugin(
+        tauri_plugin_global_shortcut::Builder::new()
+            .with_handler(move |_app, _shortcut, event| {
+                // Fire once per press; the OS repeats the key while it is held.
+                if event.state() == ShortcutState::Pressed {
+                    toggle_main_window(&handle);
+                }
+            })
+            .build(),
+    );
+    if let Err(error) = registered {
+        eprintln!("[InstaDesk] global shortcut plugin unavailable: {error}");
+        return;
+    }
+    if let Err(error) = app.global_shortcut().register(TOGGLE_SHORTCUT) {
+        eprintln!("[InstaDesk] could not register {TOGGLE_SHORTCUT}: {error}");
+    }
+}
+
 fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
     let Some(window) = app.get_window("main") else {
         return;
@@ -209,95 +230,6 @@ fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn alt_toggle_hook(
-    code: i32,
-    wparam: windows::Win32::Foundation::WPARAM,
-    lparam: windows::Win32::Foundation::LPARAM,
-) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::UI::{
-        Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LMENU, VK_MENU, VK_RMENU},
-        WindowsAndMessaging::{
-            CallNextHookEx, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, WM_KEYDOWN, WM_KEYUP,
-            WM_SYSKEYDOWN, WM_SYSKEYUP,
-        },
-    };
-
-    if code >= 0 {
-        let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-        if !event.flags.contains(LLKHF_INJECTED) {
-            let pressed = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-            let released = matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP);
-
-            let is_alt = event.vkCode == VK_LMENU.0 as u32
-                || event.vkCode == VK_RMENU.0 as u32
-                || event.vkCode == VK_MENU.0 as u32;
-
-            if is_alt {
-                let is_right_alt = event.vkCode == VK_RMENU.0 as u32
-                    || (event.vkCode == VK_MENU.0 as u32 && event.flags.contains(LLKHF_EXTENDED));
-                let is_left_alt = event.vkCode == VK_LMENU.0 as u32
-                    || (event.vkCode == VK_MENU.0 as u32 && !event.flags.contains(LLKHF_EXTENDED));
-
-                if is_left_alt && (pressed || released) {
-                    LEFT_ALT_DOWN.store(pressed, Ordering::SeqCst);
-                }
-                if is_right_alt && (pressed || released) {
-                    RIGHT_ALT_DOWN.store(pressed, Ordering::SeqCst);
-                }
-
-                let left_phys = (GetAsyncKeyState(VK_LMENU.0 as i32) as u16 & 0x8000) != 0;
-                let right_phys = (GetAsyncKeyState(VK_RMENU.0 as i32) as u16 & 0x8000) != 0;
-
-                let left_active = LEFT_ALT_DOWN.load(Ordering::SeqCst) || left_phys;
-                let right_active = RIGHT_ALT_DOWN.load(Ordering::SeqCst) || right_phys;
-
-                if released && (is_left_alt || is_right_alt) {
-                    ALT_TOGGLE_FIRED.store(false, Ordering::SeqCst);
-                } else if left_active
-                    && right_active
-                    && !ALT_TOGGLE_FIRED.swap(true, Ordering::SeqCst)
-                {
-                    if let Some(sender) = ALT_TOGGLE_SENDER.get() {
-                        let _ = sender.send(());
-                    }
-                }
-            }
-        }
-    }
-    unsafe { CallNextHookEx(None, code, wparam, lparam) }
-}
-
-#[cfg(windows)]
-fn install_alt_toggle<R: Runtime>(app: &AppHandle<R>) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetMessageW, SetWindowsHookExW, MSG, WH_KEYBOARD_LL,
-    };
-
-    let (sender, receiver) = mpsc::channel();
-    if ALT_TOGGLE_SENDER.set(sender).is_err() {
-        return;
-    }
-    let handle = app.clone();
-    std::thread::spawn(move || {
-        while receiver.recv().is_ok() {
-            toggle_main_window(&handle);
-        }
-    });
-    std::thread::spawn(move || unsafe {
-        let hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(alt_toggle_hook), None, 0) {
-            Ok(hook) => hook,
-            Err(error) => {
-                eprintln!("[InstaDesk] could not install Left Alt + Right Alt shortcut: {error}");
-                return;
-            }
-        };
-        let mut message = MSG::default();
-        while GetMessageW(&mut message, None, 0, 0).as_bool() {}
-        let _ = windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(hook);
-    });
 }
 
 #[cfg(windows)]
@@ -1154,8 +1086,7 @@ pub fn run() {
                 }
                 ensure_windows_shortcut_registered();
             }
-            #[cfg(windows)]
-            install_alt_toggle(app.handle());
+            install_toggle_shortcut(app.handle());
             if std::env::args().any(|arg| arg == "--hidden") { let _ = window.hide(); }
             if std::env::args().any(|arg| arg == "--open-settings") { show_settings(app.handle()); }
             #[cfg(debug_assertions)]
