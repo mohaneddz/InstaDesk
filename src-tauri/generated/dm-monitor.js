@@ -304,11 +304,12 @@
     let controls = { ...DEFAULT_CONTROLS, ...win.__INSTADESK_CONTENT_CONTROLS__ };
     let redirecting = false;
     const loggedIn = () => Boolean(win.document.querySelector('a[href^="/direct/"]')) && !win.document.querySelector('input[name="password"]');
+    const restore = (element) => {
+      element.style.removeProperty("display");
+      element.removeAttribute("data-instadesk-hidden");
+    };
     const restoreLayout = () => {
-      win.document.querySelectorAll("[data-instadesk-hidden]").forEach((element) => {
-        element.style.removeProperty("display");
-        element.removeAttribute("data-instadesk-hidden");
-      });
+      win.document.querySelectorAll("[data-instadesk-hidden]").forEach(restore);
       win.document.querySelectorAll("[data-instadesk-feed-column]").forEach((element) => {
         element.style.removeProperty("margin-left");
         element.style.removeProperty("margin-right");
@@ -344,27 +345,35 @@
       return current;
     };
     let lastHiddenCount = -1;
-    const hideUnreadBadges = () => {
+    const unreadBadges = () => {
+      const found = [];
       for (const labelled of win.document.querySelectorAll("[aria-label]")) {
         if (/unread/i.test(labelled.getAttribute("aria-label") ?? "")) hide(labelled);
       }
       for (const link of win.document.querySelectorAll('a[href*="/direct/"], [role="link"]')) {
         for (const leaf of link.querySelectorAll("span, div")) {
-          if (leaf.childElementCount === 0 && /^\d+\+?$/.test(normalizedText(leaf))) hide(leaf.parentElement ?? leaf);
+          if (leaf.childElementCount === 0 && /^\d+\+?$/.test(normalizedText(leaf))) found.push(leaf.parentElement ?? leaf);
         }
       }
+      return found;
+    };
+    const reconcileHidden = (targets) => {
+      for (const element of win.document.querySelectorAll("[data-instadesk-hidden]")) {
+        if (!targets.has(element)) restore(element);
+      }
+      for (const element of targets) hide(element);
     };
     const applySemanticLayout = () => {
-      restoreLayout();
+      const targets = /* @__PURE__ */ new Set();
       const main = win.document.querySelector("main");
       if (main) {
         if (controls.disableStories) {
           const storyLink = main.querySelector('a[href*="/stories/"]') ?? main.querySelector(`[aria-label*="story" i][role="button"], [aria-label$="\u2019s story" i]`);
-          if (storyLink) hide(enclosingBlock(storyLink, main));
+          if (storyLink) targets.add(enclosingBlock(storyLink, main));
         }
         if (controls.disableSuggestions) {
           const headings = [...win.document.querySelectorAll("span,div,h1,h2,h3,h4")].filter((element) => element.childElementCount === 0 && /^Suggested for you$/i.test(normalizedText(element)));
-          for (const heading of headings) hide(enclosingBlock(heading, main));
+          for (const heading of headings) targets.add(enclosingBlock(heading, main));
           const article = main.querySelector("article");
           if (article) {
             let feedColumn = article.parentElement;
@@ -385,16 +394,17 @@
         for (const row of rows) {
           const kind = inboxRowKind(row);
           if (kind === "private" && controls.hidePrivateChats || kind === "group" && controls.hideGroupChats || controls.hidePrivateChats && controls.hideGroupChats) {
-            hide(enclosingRowBlock(row));
+            targets.add(enclosingRowBlock(row));
             hidden++;
           }
         }
-        hideUnreadBadges();
+        for (const badge of unreadBadges()) targets.add(badge);
         if (hidden !== lastHiddenCount) {
           lastHiddenCount = hidden;
           console.debug("[InstaDesk] chat hiding pass", { rows: rows.length, hidden, controls: { hidePrivateChats: controls.hidePrivateChats, hideGroupChats: controls.hideGroupChats } });
         }
       }
+      reconcileHidden(targets);
     };
     const apply = () => {
       if (!win.document?.documentElement) return;
@@ -405,6 +415,9 @@
       if (controls.disableSearch) rules.push('[role="button"]:has([aria-label="Search"]),[role="link"]:has([aria-label="Search"]),a:has([aria-label="Search"])');
       if (controls.disablePosts) rules.push("main article");
       if (controls.disableStories) rules.push('main a[href*="/stories/"]');
+      if (controls.hidePrivateChats && controls.hideGroupChats) {
+        rules.push('a[href*="/direct/t/"]', '[role="listitem"]:has(a[href*="/direct/t/"])');
+      }
       style.textContent = rules.length ? `${rules.join(",")} { display:none !important; }` : "";
       applySemanticLayout();
       const pathname = win.location?.pathname;

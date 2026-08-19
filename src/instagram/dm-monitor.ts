@@ -367,11 +367,12 @@ export function installContentControls(win: Window): void {
   let redirecting = false;
 
   const loggedIn = () => Boolean(win.document.querySelector('a[href^="/direct/"]')) && !win.document.querySelector('input[name="password"]');
+  const restore = (element: HTMLElement) => {
+    element.style.removeProperty("display");
+    element.removeAttribute("data-instadesk-hidden");
+  };
   const restoreLayout = () => {
-    win.document.querySelectorAll<HTMLElement>("[data-instadesk-hidden]").forEach((element) => {
-      element.style.removeProperty("display");
-      element.removeAttribute("data-instadesk-hidden");
-    });
+    win.document.querySelectorAll<HTMLElement>("[data-instadesk-hidden]").forEach(restore);
     win.document.querySelectorAll<HTMLElement>("[data-instadesk-feed-column]").forEach((element) => {
       element.style.removeProperty("margin-left");
       element.style.removeProperty("margin-right");
@@ -417,24 +418,36 @@ export function installContentControls(win: Window): void {
   // Instagram keeps painting its own unread count on the DM entry points even
   // when the conversations behind it are hidden, which defeats the point of
   // hiding them; drop the count and the dot alongside the rows.
-  const hideUnreadBadges = () => {
+  const unreadBadges = (): HTMLElement[] => {
+    const found: HTMLElement[] = [];
     for (const labelled of win.document.querySelectorAll<HTMLElement>("[aria-label]")) {
       if (/unread/i.test(labelled.getAttribute("aria-label") ?? "")) hide(labelled);
     }
     for (const link of win.document.querySelectorAll<HTMLElement>('a[href*="/direct/"], [role="link"]')) {
       for (const leaf of link.querySelectorAll<HTMLElement>("span, div")) {
-        if (leaf.childElementCount === 0 && /^\d+\+?$/.test(normalizedText(leaf))) hide(leaf.parentElement ?? leaf);
+        if (leaf.childElementCount === 0 && /^\d+\+?$/.test(normalizedText(leaf))) found.push(leaf.parentElement ?? leaf);
       }
     }
+    return found;
+  };
+  // Reconciles the hidden set in one pass. The previous version unhid
+  // everything and then hid it again on every DOM mutation, and Instagram
+  // mutates its inbox constantly — so each pass painted a frame with the
+  // hidden chats back on screen, which is the flicker.
+  const reconcileHidden = (targets: Set<HTMLElement>) => {
+    for (const element of win.document.querySelectorAll<HTMLElement>("[data-instadesk-hidden]")) {
+      if (!targets.has(element)) restore(element);
+    }
+    for (const element of targets) hide(element);
   };
   const applySemanticLayout = () => {
-    restoreLayout();
+    const targets = new Set<HTMLElement>();
     const main = win.document.querySelector<HTMLElement>("main");
     if (main) {
       if (controls.disableStories) {
         const storyLink = main.querySelector<HTMLElement>('a[href*="/stories/"]')
           ?? main.querySelector<HTMLElement>(`[aria-label*="story" i][role="button"], [aria-label$="’s story" i]`);
-        if (storyLink) hide(enclosingBlock(storyLink, main));
+        if (storyLink) targets.add(enclosingBlock(storyLink, main));
       }
 
       if (controls.disableSuggestions) {
@@ -442,7 +455,7 @@ export function installContentControls(win: Window): void {
         // accounts panel "Suggested for you"; hide the block behind each one.
         const headings = [...win.document.querySelectorAll<HTMLElement>("span,div,h1,h2,h3,h4")]
           .filter((element) => element.childElementCount === 0 && /^Suggested for you$/i.test(normalizedText(element)));
-        for (const heading of headings) hide(enclosingBlock(heading, main));
+        for (const heading of headings) targets.add(enclosingBlock(heading, main));
 
         // With the right rail gone, recenter the remaining feed column.
         const article = main.querySelector<HTMLElement>("article");
@@ -466,16 +479,17 @@ export function installContentControls(win: Window): void {
       for (const row of rows) {
         const kind = inboxRowKind(row);
         if ((kind === "private" && controls.hidePrivateChats) || (kind === "group" && controls.hideGroupChats) || (controls.hidePrivateChats && controls.hideGroupChats)) {
-          hide(enclosingRowBlock(row));
+          targets.add(enclosingRowBlock(row));
           hidden++;
         }
       }
-      hideUnreadBadges();
+      for (const badge of unreadBadges()) targets.add(badge);
       if (hidden !== lastHiddenCount) {
         lastHiddenCount = hidden;
         console.debug("[InstaDesk] chat hiding pass", { rows: rows.length, hidden, controls: { hidePrivateChats: controls.hidePrivateChats, hideGroupChats: controls.hideGroupChats } });
       }
     }
+    reconcileHidden(targets);
   };
   const apply = () => {
     if (!win.document?.documentElement) return;
@@ -486,6 +500,12 @@ export function installContentControls(win: Window): void {
     if (controls.disableSearch) rules.push('[role="button"]:has([aria-label="Search"]),[role="link"]:has([aria-label="Search"]),a:has([aria-label="Search"])');
     if (controls.disablePosts) rules.push("main article");
     if (controls.disableStories) rules.push('main a[href*="/stories/"]');
+    // With every kind hidden there is nothing to classify, so a plain rule can
+    // keep rows down from the moment Instagram inserts them — the JS pass that
+    // follows only has to take out the surrounding wrapper.
+    if (controls.hidePrivateChats && controls.hideGroupChats) {
+      rules.push('a[href*="/direct/t/"]', '[role="listitem"]:has(a[href*="/direct/t/"])');
+    }
     style.textContent = rules.length ? `${rules.join(",")} { display:none !important; }` : "";
     applySemanticLayout();
     const pathname = win.location?.pathname;
