@@ -93,9 +93,10 @@
     hidePrivateChats: false,
     hideGroupChats: false
   };
-  var THREAD_RE = /^\/direct\/t\/([^/?#]+)\/?/;
+  var THREAD_RE = /(?:^|\/)direct\/t\/([^/?#]+)\/?/;
   var GROUP_WORDS = /\b(group|members?|participants?|people)\b/i;
-  var OWN_WORDS = /\b(you sent|sent by you|your message)\b/i;
+  var OWN_WORDS = /^\s*you\s*(?::|\b(?:sent|reacted|shared|replied|called|unsent)\b)/i;
+  var TIMESTAMP_SUFFIX = /\s*·\s*(?:now|just now|\d+\s*[smhdw]|yesterday|\d+\s*(?:sec|min|hour|hr|day|week)s?(?:\s+ago)?)\s*$/i;
   var PROFILE_RE = /^\/(?!direct(?:\/|$)|explore(?:\/|$)|reels?(?:\/|$)|accounts(?:\/|$)|p(?:\/|$))([A-Za-z0-9._]+)\/?$/;
   function normalizedText(node) {
     return (node?.textContent ?? "").replace(/\s+/g, " ").trim();
@@ -119,12 +120,31 @@
     if (controls.disableExplore && /^\/explore(?:\/|$)/.test(pathname)) return true;
     return false;
   }
+  var TIME_ONLY = /^(?:·|•|\.|\d+\s*[smhdw]|yesterday|now|just now|\d+\s*(?:sec|min|hour|hr|day|week)s?(?:\s+ago)?)$/i;
   function classifyThread(document2) {
-    const main = document2.querySelector("main") ?? document2.body;
-    const header = main.querySelector("header") ?? main.querySelector('[role="banner"]');
-    if (!header) return { kind: "unknown" };
-    const semantic = [header.getAttribute("aria-label"), normalizedText(header)].filter(Boolean).join(" ");
+    const root = document2.querySelector('div[role="main"]') ?? document2.querySelector("main") ?? document2.body;
+    const header = root.querySelector("header") ?? root.querySelector('[role="banner"]') ?? root.querySelector('[aria-label*="conversation" i]') ?? root.querySelector('[aria-label*="thread" i]') ?? root.querySelector('div[role="main"] > div > div:first-child') ?? root.querySelector("main > div > div > div:first-child") ?? root;
+    const semantic = [
+      header.getAttribute("aria-label"),
+      normalizedText(header),
+      ...[...header.querySelectorAll("[aria-label]")].map((el) => el.getAttribute("aria-label"))
+    ].filter(Boolean).join(" ");
     if (GROUP_WORDS.test(semantic)) return { kind: "group" };
+    const hasGroupDetails = Boolean(
+      root.querySelector('a[href*="/details"], button[aria-label*="details" i], button[aria-label*="members" i], button[aria-label*="people" i], [aria-label*="group details" i]')
+    );
+    if (hasGroupDetails) return { kind: "group" };
+    for (const img of header.querySelectorAll("img[alt]")) {
+      const alt = img.alt || "";
+      if (alt.includes(",") || /\band\b/i.test(alt) || GROUP_WORDS.test(alt)) return { kind: "group" };
+    }
+    if (header.querySelectorAll("img").length >= 2) return { kind: "group" };
+    const headerTitles = [...header.querySelectorAll("h1, h2, h3, h4, span, div")].filter((el) => el.children.length === 0).map((el) => normalizedText(el)).filter((t) => t.length > 0 && t.length < 100 && !TIME_ONLY.test(t));
+    for (const title of headerTitles) {
+      if (title.includes(",") && title.split(",").length >= 2) {
+        return { kind: "group" };
+      }
+    }
     const peers = /* @__PURE__ */ new Map();
     for (const link of header.querySelectorAll("a[href]")) {
       let path;
@@ -139,34 +159,78 @@
       const name = (link.getAttribute("aria-label") || normalizedText(link) || match[1]).trim();
       peers.set(handle, name);
     }
-    if (peers.size !== 1) return { kind: peers.size > 1 ? "group" : "unknown" };
-    return { kind: "private", peer: [...peers.values()][0] };
-  }
-  function isOwnLastMessage(row, preview) {
-    const text = `${row.getAttribute("aria-label") ?? ""} ${normalizedText(row)}`;
-    return OWN_WORDS.test(text) || /^you\s*:/i.test(preview);
-  }
-  function inboxRowKind(row) {
-    const text = `${row.getAttribute("aria-label") ?? ""} ${normalizedText(row)}`;
-    if (GROUP_WORDS.test(text)) return "group";
-    const avatars = row.querySelectorAll("img").length;
-    if (avatars >= 2) return "group";
-    if (avatars === 1) return "private";
-    return "unknown";
+    if (peers.size > 1) return { kind: "group" };
+    if (peers.size === 1) return { kind: "private", peer: [...peers.values()][0] };
+    if (header.querySelectorAll("img").length === 1 && headerTitles.length > 0) {
+      const candidateName = headerTitles[0];
+      if (!candidateName.includes(",") && !GROUP_WORDS.test(candidateName)) {
+        return { kind: "private", peer: candidateName };
+      }
+    }
+    return { kind: "unknown" };
   }
   function inboxRowTitle(row) {
-    const nameSpan = row.querySelector("span");
-    const name = nameSpan ? normalizedText(nameSpan) : "";
-    return name || (row.getAttribute("aria-label") ?? "").split(",")[0].trim() || "Instagram";
+    const directSpans = [...row.querySelectorAll("span, div, h2, h3, h4")].filter((el) => el.children.length === 0).map((el) => normalizedText(el)).filter((txt) => txt.length > 0 && !TIME_ONLY.test(txt) && txt !== "\xB7");
+    if (directSpans.length > 0) {
+      return directSpans[0];
+    }
+    const avatarImg = row.querySelector("img[alt]");
+    if (avatarImg?.alt) {
+      const fromAlt = avatarImg.alt.replace(/'s profile picture.*/i, "").replace(/^profile picture of\s+/i, "").trim();
+      if (fromAlt) return fromAlt;
+    }
+    const ariaLabel = row.getAttribute("aria-label") || row.querySelector("[aria-label]")?.getAttribute("aria-label");
+    if (ariaLabel) {
+      return ariaLabel.replace(/^chat with\s+/i, "").replace(/^group chat with\s+/i, "").trim();
+    }
+    return "Instagram";
   }
   function inboxRowPreview(row) {
-    const text = normalizedText(row);
     const title = inboxRowTitle(row);
-    const rest = title && text.startsWith(title) ? text.slice(title.length) : text;
-    return rest.replace(/^[\s·:,-]+/, "").slice(0, 240);
+    const fullText = normalizedText(row);
+    let preview = "";
+    const leafSpans = [...row.querySelectorAll("span, div")].filter((s) => s.children.length === 0).map((s) => normalizedText(s)).filter((t) => Boolean(t) && !TIME_ONLY.test(t) && t !== "\xB7");
+    const nonTitle = leafSpans.filter((t) => t !== title);
+    if (nonTitle.length > 0) {
+      preview = nonTitle.join(" ");
+    } else if (title && fullText.startsWith(title)) {
+      preview = fullText.slice(title.length).trim();
+    } else {
+      preview = fullText;
+    }
+    preview = preview.replace(/^[\s·:,-]+/, "").trim();
+    preview = preview.replace(TIMESTAMP_SUFFIX, "").trim();
+    return preview.slice(0, 240);
+  }
+  function inboxRowKind(row) {
+    const ariaLabel = row.getAttribute("aria-label") ?? row.querySelector("[aria-label]")?.getAttribute("aria-label") ?? "";
+    const text = `${ariaLabel} ${normalizedText(row)}`;
+    if (GROUP_WORDS.test(text)) return "group";
+    if (/group/i.test(row.className || "")) return "group";
+    const title = inboxRowTitle(row);
+    if (title.includes(",") && title.split(",").length >= 2) return "group";
+    if (ariaLabel.includes(",") && ariaLabel.split(",").length >= 2) return "group";
+    for (const img of row.querySelectorAll("img[alt]")) {
+      const alt = img.alt || "";
+      if (alt.includes(",") || /\band\b/i.test(alt) || GROUP_WORDS.test(alt)) return "group";
+    }
+    const avatars = row.querySelectorAll("img").length;
+    if (avatars >= 2) return "group";
+    const stackedOrGroupIndicators = row.querySelectorAll('canvas, svg, [class*="group" i], [aria-label*="group" i]');
+    if (stackedOrGroupIndicators.length >= 2) return "group";
+    const preview = inboxRowPreview(row);
+    if (/^[A-Za-z0-9._\s]+:\s+\S+/.test(preview) && !OWN_WORDS.test(preview)) {
+      return "group";
+    }
+    return "private";
+  }
+  function isOwnLastMessage(row, preview) {
+    const ariaLabel = row.getAttribute("aria-label") ?? "";
+    const fullText = normalizedText(row);
+    return OWN_WORDS.test(preview) || OWN_WORDS.test(ariaLabel) || /^\s*you\s*:/i.test(fullText) || /^\s*you\s+sent\b/i.test(fullText);
   }
   function parseInboxList(document2, origin = "https://www.instagram.com") {
-    const rows = [...document2.querySelectorAll('a[href^="/direct/t/"]')];
+    const rows = [...document2.querySelectorAll('a[href*="/direct/t/"]')];
     return rows.flatMap((row) => {
       const conversationId = threadIdFromPath(row.getAttribute("href") ?? "");
       if (!conversationId) return [];
@@ -207,6 +271,9 @@
   function installNavigationShortcuts(win) {
     if (win.__INSTADESK_SHORTCUTS__) return;
     win.__INSTADESK_SHORTCUTS__ = true;
+    let leftAlt = false;
+    let rightAlt = false;
+    let toggleFired = false;
     win.addEventListener("keydown", (event) => {
       if (event.key === "F11") {
         event.preventDefault();
@@ -214,8 +281,23 @@
         nativeAction(win, "fullscreen");
         return;
       }
-      if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
-        nativeAction(win, "hide_if_open");
+      if (event.code === "AltLeft") leftAlt = true;
+      if (event.code === "AltRight") rightAlt = true;
+      if (leftAlt && rightAlt && !toggleFired) {
+        toggleFired = true;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        nativeAction(win, "toggle_window");
+      }
+    }, true);
+    win.addEventListener("keyup", (event) => {
+      if (event.code === "AltLeft") {
+        leftAlt = false;
+        toggleFired = false;
+      }
+      if (event.code === "AltRight") {
+        rightAlt = false;
+        toggleFired = false;
       }
     }, true);
   }
@@ -250,40 +332,78 @@
         const parent = block.parentElement;
         if (!parent || parent === root || parent === win.document.body) break;
         if (parent.querySelector("article") || parent.querySelector('nav,[role="navigation"]')) break;
+        if (parent.querySelectorAll('a[href*="/direct/t/"]').length > 1) break;
         block = parent;
       }
       return block;
     };
+    const enclosingRowBlock = (row) => {
+      let current = row;
+      while (current.parentElement && current.parentElement !== win.document.body) {
+        const parent = current.parentElement;
+        if (parent.querySelectorAll('a[href*="/direct/t/"]').length > 1) break;
+        if (parent.tagName === "MAIN" || parent.tagName === "NAV" || parent.getAttribute("role") === "navigation" || parent.getAttribute("role") === "main") break;
+        current = parent;
+      }
+      return current;
+    };
+    let lastHiddenCount = -1;
+    const hideUnreadBadges = () => {
+      for (const labelled of win.document.querySelectorAll("[aria-label]")) {
+        if (/unread/i.test(labelled.getAttribute("aria-label") ?? "")) hide(labelled);
+      }
+      for (const link of win.document.querySelectorAll('a[href*="/direct/"], [role="link"]')) {
+        for (const leaf of link.querySelectorAll("span, div")) {
+          if (leaf.childElementCount === 0 && /^\d+\+?$/.test(normalizedText(leaf))) hide(leaf.parentElement ?? leaf);
+        }
+      }
+    };
     const applySemanticLayout = () => {
       restoreLayout();
       const main = win.document.querySelector("main");
-      if (!main) return;
-      if (controls.disableStories) {
-        const storyLink = main.querySelector('a[href*="/stories/"]') ?? main.querySelector(`[aria-label*="story" i][role="button"], [aria-label$="\u2019s story" i]`);
-        if (storyLink) hide(enclosingBlock(storyLink, main));
-      }
-      if (controls.disableSuggestions) {
-        const headings = [...win.document.querySelectorAll("span,div,h1,h2,h3,h4")].filter((element) => element.childElementCount === 0 && /^Suggested for you$/i.test(normalizedText(element)));
-        for (const heading of headings) hide(enclosingBlock(heading, main));
-        const article = main.querySelector("article");
-        if (article) {
-          let feedColumn = article.parentElement;
-          while (feedColumn?.parentElement && feedColumn.parentElement !== main && feedColumn.parentElement.childElementCount < 2) {
-            feedColumn = feedColumn.parentElement;
-          }
-          if (feedColumn) {
-            feedColumn.dataset.instadeskFeedColumn = "";
-            feedColumn.style.setProperty("margin-left", "auto", "important");
-            feedColumn.style.setProperty("margin-right", "auto", "important");
+      if (main) {
+        if (controls.disableStories) {
+          const storyLink = main.querySelector('a[href*="/stories/"]') ?? main.querySelector(`[aria-label*="story" i][role="button"], [aria-label$="\u2019s story" i]`);
+          if (storyLink) hide(enclosingBlock(storyLink, main));
+        }
+        if (controls.disableSuggestions) {
+          const headings = [...win.document.querySelectorAll("span,div,h1,h2,h3,h4")].filter((element) => element.childElementCount === 0 && /^Suggested for you$/i.test(normalizedText(element)));
+          for (const heading of headings) hide(enclosingBlock(heading, main));
+          const article = main.querySelector("article");
+          if (article) {
+            let feedColumn = article.parentElement;
+            while (feedColumn?.parentElement && feedColumn.parentElement !== main && feedColumn.parentElement.childElementCount < 2) {
+              feedColumn = feedColumn.parentElement;
+            }
+            if (feedColumn) {
+              feedColumn.dataset.instadeskFeedColumn = "";
+              feedColumn.style.setProperty("margin-left", "auto", "important");
+              feedColumn.style.setProperty("margin-right", "auto", "important");
+            }
           }
         }
       }
       if (controls.hidePrivateChats || controls.hideGroupChats) {
-        for (const row of main.querySelectorAll('a[href^="/direct/t/"]')) {
+        let hidden = 0;
+        const rows = win.document.querySelectorAll('a[href*="/direct/t/"]');
+        for (const row of rows) {
           const kind = inboxRowKind(row);
-          if (kind === "private" && controls.hidePrivateChats || kind === "group" && controls.hideGroupChats) {
-            hide(enclosingBlock(row, main));
+          if (kind === "private" && controls.hidePrivateChats || kind === "group" && controls.hideGroupChats || controls.hidePrivateChats && controls.hideGroupChats) {
+            hide(enclosingRowBlock(row));
+            hidden++;
           }
+        }
+        if (controls.hidePrivateChats && controls.hideGroupChats && !rows.length) {
+          for (const item of win.document.querySelectorAll('[role="listitem"]')) {
+            if (!item.querySelector("img")) continue;
+            hide(item);
+            hidden++;
+          }
+        }
+        hideUnreadBadges();
+        if (hidden !== lastHiddenCount) {
+          lastHiddenCount = hidden;
+          console.debug("[InstaDesk] chat hiding pass", { rows: rows.length, hidden, controls: { hidePrivateChats: controls.hidePrivateChats, hideGroupChats: controls.hideGroupChats } });
         }
       }
     };
@@ -303,22 +423,30 @@
       if (!redirecting && blockedDestination(pathname, controls, loggedIn())) {
         redirecting = true;
         console.debug("[InstaDesk] blocked page redirected to DMs", { pathname });
-        win.location.replace("/direct/inbox/");
+        try {
+          win.location.replace("/direct/inbox/");
+        } catch {
+        }
         return;
       }
       if (!redirecting && threadIdFromPath(pathname) && (controls.hidePrivateChats || controls.hideGroupChats)) {
         const classification = classifyThread(win.document);
-        const hidden = classification.kind === "private" && controls.hidePrivateChats || classification.kind === "group" && controls.hideGroupChats;
+        const hidden = controls.hidePrivateChats && controls.hideGroupChats || classification.kind === "private" && controls.hidePrivateChats || classification.kind === "group" && controls.hideGroupChats;
         if (hidden) {
           redirecting = true;
           console.debug("[InstaDesk] hidden conversation redirected to DMs", { pathname });
-          win.location.replace("/direct/inbox/");
+          try {
+            win.location.replace("/direct/inbox/");
+          } catch {
+          }
         }
       }
     };
     const refresh = async () => {
       try {
-        controls = { ...DEFAULT_CONTROLS, ...await win.__TAURI_INTERNALS__?.invoke("get_content_controls") };
+        const fetched = await win.__TAURI_INTERNALS__?.invoke("get_content_controls");
+        if (!fetched) throw new Error("content controls unavailable over IPC");
+        controls = { ...DEFAULT_CONTROLS, ...fetched };
         win.__INSTADESK_CONTENT_CONTROLS__ = controls;
         redirecting = false;
         apply();
@@ -335,19 +463,35 @@
         event.stopImmediatePropagation();
         return;
       }
+      const threadLink = target.closest('a[href*="/direct/t/"]');
+      if (threadLink && (controls.hidePrivateChats || controls.hideGroupChats)) {
+        const kind = inboxRowKind(threadLink);
+        if (kind === "private" && controls.hidePrivateChats || kind === "group" && controls.hideGroupChats || controls.hidePrivateChats && controls.hideGroupChats) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          console.debug("[InstaDesk] prevented opening hidden conversation", { kind });
+          return;
+        }
+      }
       const link = target.closest("a[href]");
       if (!link) return;
       try {
         if (blockedDestination(new URL(link.href, win.location.href).pathname, controls, loggedIn())) {
           event.preventDefault();
           event.stopImmediatePropagation();
-          win.location.assign("/direct/inbox/");
+          try {
+            win.location.assign("/direct/inbox/");
+          } catch {
+          }
         }
       } catch {
       }
     }, true);
     new MutationObserver(apply).observe(win.document.body, { childList: true, subtree: true });
-    win.addEventListener("popstate", apply);
+    win.addEventListener("popstate", () => {
+      redirecting = false;
+      apply();
+    });
     win.addEventListener("instadesk:settings-changed", (event) => {
       const changed = event.detail;
       if (!changed) {
@@ -507,6 +651,18 @@
       }
       return nativeSend.call(this, body);
     };
+    const nativeSendBeacon = win.navigator.sendBeacon?.bind(win.navigator);
+    if (nativeSendBeacon) {
+      win.navigator.sendBeacon = (url, data) => {
+        const urlStr = String(url);
+        const bodyText = typeof data === "string" ? data : void 0;
+        if (enabled() && looksLikeStorySeenRequest(urlStr, bodyText)) {
+          console.debug("[InstaDesk] ghost mode suppressed a story view receipt (sendBeacon)");
+          return true;
+        }
+        return nativeSendBeacon(url, data);
+      };
+    }
   }
   function sleep(win, ms) {
     return new Promise((resolve) => win.setTimeout(resolve, ms));
@@ -664,15 +820,17 @@
       try {
         const candidates = parseInboxList(win.document);
         if (!primed) {
-          for (const item of candidates) seen.set(item.conversationId, item.messageKey);
-          primed = true;
-          console.debug(`[InstaDesk] inbox monitor primed with ${seen.size} conversations`);
+          if (candidates.length > 0) {
+            for (const item of candidates) seen.set(item.conversationId, item.messageKey);
+            primed = true;
+            console.debug(`[InstaDesk] inbox monitor primed with ${seen.size} conversations`);
+          }
           return;
         }
         for (const item of candidates) {
           if (seen.get(item.conversationId) === item.messageKey) continue;
           seen.set(item.conversationId, item.messageKey);
-          console.debug("[InstaDesk] incoming message detected", { conversationId: item.conversationId, kind: item.kind });
+          console.debug("[InstaDesk] incoming message detected", { conversationId: item.conversationId, kind: item.kind, sender: item.sender, preview: item.preview });
           void win.__TAURI_INTERNALS__?.invoke("incoming_message", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
         }
       } catch (error) {
@@ -700,6 +858,7 @@
         installGhostStories(window);
         installPostMediaActions(window);
         installStoryMediaActions(window);
+        installInboxMonitor(window);
       };
       if (document.body) installPageFeatures();
       else document.addEventListener("DOMContentLoaded", installPageFeatures, { once: true });
