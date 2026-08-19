@@ -939,23 +939,52 @@ export function installInboxMonitor(win: Window): void {
   const seen = new Map<string, string>();
   let primed = false;
   let timer: number | undefined;
+  let emptyScans = 0;
+  let reportedShape = false;
+
+  const report = (label: string, detail: string) => {
+    console.debug(`[InstaDesk] ${label}`, detail);
+    void win.__TAURI_INTERNALS__?.invoke("report_diagnostic", { label, detail }).catch(() => { /* diagnostics are best effort */ });
+  };
+  // Instagram's inbox markup drifts; when a scan comes up empty the structure it
+  // found instead is worth more than the silence. Only the shape is reported —
+  // element names and counts, never message text.
+  const reportShape = () => {
+    if (reportedShape) return;
+    reportedShape = true;
+    const count = (selector: string) => win.document.querySelectorAll(selector).length;
+    report("inbox scan found no conversations", JSON.stringify({
+      url: win.location.pathname,
+      threadAnchors: count('a[href*="/direct/t/"]'),
+      directAnchors: count('a[href*="/direct/"]'),
+      listItems: count('[role="listitem"]'),
+      rows: count('[role="row"]'),
+      lists: count('[role="list"]'),
+      buttons: count('[role="button"][tabindex="0"]'),
+      images: count("main img"),
+      candidateRows: inboxRowElements(win.document).length,
+      loginForm: count('input[name="password"]') > 0
+    }));
+  };
 
   const scan = () => {
     timer = undefined;
     try {
       const candidates = parseInboxList(win.document);
+      if (!candidates.length && ++emptyScans === 4) reportShape();
+      if (candidates.length) emptyScans = 0;
       if (!primed) {
         if (candidates.length > 0) {
           for (const item of candidates) seen.set(item.conversationId, item.messageKey);
           primed = true;
-          console.debug(`[InstaDesk] inbox monitor primed with ${seen.size} conversations`);
+          report("inbox monitor primed", `${seen.size} conversations`);
         }
         return;
       }
       for (const item of candidates) {
         if (seen.get(item.conversationId) === item.messageKey) continue;
         seen.set(item.conversationId, item.messageKey);
-        console.debug("[InstaDesk] incoming message detected", { conversationId: item.conversationId, kind: item.kind, sender: item.sender, preview: item.preview });
+        report("incoming message detected", `${item.kind} from ${item.sender}`);
         void win.__TAURI_INTERNALS__?.invoke("incoming_message", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
       }
     } catch (error) { console.warn("[InstaDesk] inbox parsing failure", error); }

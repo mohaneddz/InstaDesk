@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "inbox-webview",
+  "description": "Permissions for the hidden background inbox monitor WebView (remote page — incoming_message only)",
+  "windows": ["main", "inbox"],
+  "permissions": [
+    "core:default",
+    "allow-incoming-message",
+    "allow-report-diagnostic"
+  ],
+  "remote": { "urls": ["https://instagram.com/*", "https://www.instagram.com/*"] }
+}

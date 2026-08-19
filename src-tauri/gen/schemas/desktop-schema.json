@@ -207,6 +207,12 @@
           "markdownDescription": "Enables the incoming_message command without any pre-configured scope."
         },
         {
+          "description": "Enables the report_diagnostic command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-report-diagnostic",
+          "markdownDescription": "Enables the report_diagnostic command without any pre-configured scope."
+        },
+        {
           "description": "Enables the settings_ui_ready command without any pre-configured scope.",
           "type": "string",
           "const": "allow-settings-ui-ready",
@@ -253,6 +259,12 @@
           "type": "string",
           "const": "deny-incoming-message",
           "markdownDescription": "Denies the incoming_message command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the report_diagnostic command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-report-diagnostic",
+          "markdownDescription": "Denies the report_diagnostic command without any pre-configured scope."
         },
         {
           "description": "Denies the settings_ui_ready command without any pre-configured scope.",

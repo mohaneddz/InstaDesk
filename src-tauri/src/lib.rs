@@ -552,6 +552,19 @@ fn dispatch_notification<R: Runtime>(
     result
 }
 
+/// The inbox WebView is parked offscreen where devtools cannot reach it, so it
+/// reports what its scans found through here and the output lands in the
+/// terminal alongside the rest of the app's logging.
+#[tauri::command]
+fn report_diagnostic(webview: Webview, label: String, detail: String) -> Result<(), String> {
+    if webview.label() != "inbox" && webview.label() != "instagram" {
+        return Err("Diagnostics are accepted only from Instagram WebViews".into());
+    }
+    let detail: String = detail.chars().take(2000).collect();
+    eprintln!("[InstaDesk][{}] {label}: {detail}", webview.label());
+    Ok(())
+}
+
 #[tauri::command]
 fn incoming_message(app: AppHandle, webview: Webview, message: InboxMessage) -> Result<(), String> {
     if webview.label() != "inbox" && webview.label() != "instagram" {
@@ -561,7 +574,7 @@ fn incoming_message(app: AppHandle, webview: Webview, message: InboxMessage) -> 
     let Some(destination) = instagram_url(&message.conversation_url) else {
         return Err("Rejected non-Instagram conversation URL".into());
     };
-    if !destination.path().starts_with("/direct/t/")
+    if !destination.path().starts_with("/direct/")
         || message.sender.trim().is_empty()
         || message.preview.trim().is_empty()
     {
@@ -1121,7 +1134,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--hidden"])))
-        .invoke_handler(tauri::generate_handler![incoming_message, get_settings, update_settings, get_content_controls, window_action, settings_ui_ready, download_media, copy_image])
+        .invoke_handler(tauri::generate_handler![incoming_message, report_diagnostic, get_settings, update_settings, get_content_controls, window_action, settings_ui_ready, download_media, copy_image])
         .setup(|app| {
             let settings = load_settings(app.handle());
             app.manage(AppState {

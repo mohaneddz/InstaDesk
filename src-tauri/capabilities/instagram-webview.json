@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "instagram-webview",
+  "description": "Permissions for the main Instagram WebView (remote page — content controls, download, copy)",
+  "windows": ["main", "instagram"],
+  "permissions": [
+    "core:default",
+    "allow-window-action",
+    "allow-get-content-controls",
+    "allow-download-media",
+    "allow-copy-image",
+    "allow-incoming-message",
+    "allow-report-diagnostic",
+    "core:window:allow-is-fullscreen",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-hide"
+  ],
+  "remote": { "urls": ["https://instagram.com/*", "https://www.instagram.com/*"] }
+}
