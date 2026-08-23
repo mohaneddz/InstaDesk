@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.instadesk.desktop",
   "build": {
-    "beforeDevCommand": "pnpm web:dev",
+    "beforeDevCommand": "npm run web:dev",
     "devUrl": "http://localhost:48317",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
@@ -13,7 +13,7 @@
     "windows": [],
     "security": {
       "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:",
-      "capabilities": ["default"]
+      "capabilities": ["main-webview", "instagram-webview", "inbox-webview", "settings-webview"]
     }
   },
   "bundle": {
