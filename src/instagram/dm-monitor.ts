@@ -1134,9 +1134,12 @@ export function installGhostStories(win: Window): void {
     };
   }
 
-  // Intercept Canvas gradient and stroke color drawing for story rings
-  if (typeof win.CanvasGradient !== "undefined") {
-    const gradProto = win.CanvasGradient.prototype;
+  // Intercept Canvas gradient and stroke color drawing for story rings.
+  // CanvasGradient/CanvasRenderingContext2D are ambient globals, not members
+  // of the `Window` interface, so they need this cast to be reachable via `win`.
+  const winGlobals = win as Window & typeof globalThis;
+  if (typeof winGlobals.CanvasGradient !== "undefined") {
+    const gradProto = winGlobals.CanvasGradient.prototype;
     const nativeAddColorStop = gradProto.addColorStop;
     gradProto.addColorStop = function (this: CanvasGradient & { __instadeskKind?: "close-friends" | "default" }, offset: number, color: string) {
       if (enabledGhost()) {
@@ -1149,8 +1152,8 @@ export function installGhostStories(win: Window): void {
     };
   }
 
-  if (typeof win.CanvasRenderingContext2D !== "undefined") {
-    const ctxProto = win.CanvasRenderingContext2D.prototype;
+  if (typeof winGlobals.CanvasRenderingContext2D !== "undefined") {
+    const ctxProto = winGlobals.CanvasRenderingContext2D.prototype;
     const strokeDesc = Object.getOwnPropertyDescriptor(ctxProto, "strokeStyle")
       || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(ctxProto), "strokeStyle");
     if (strokeDesc?.set) {
