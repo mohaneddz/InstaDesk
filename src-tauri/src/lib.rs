@@ -40,6 +40,7 @@ struct Settings {
     launch_at_startup: bool,
     minimize_to_tray: bool,
     notification_previews: bool,
+    show_notifications_when_open: bool,
     disable_home_feed: bool,
     disable_reels: bool,
     disable_explore: bool,
@@ -68,6 +69,7 @@ impl Default for Settings {
             launch_at_startup: false,
             minimize_to_tray: true,
             notification_previews: true,
+            show_notifications_when_open: true,
             disable_home_feed: false,
             disable_reels: false,
             disable_explore: false,
@@ -325,13 +327,19 @@ fn layout_main_window<R: Runtime>(window: &Window<R>) {
 }
 
 fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>> {
-    let url = url::Url::parse(INSTAGRAM_HOME).expect("valid Instagram URL");
-    let initial_settings = app
+    let initial_settings_struct = app
         .state::<AppState>()
         .settings
         .lock()
-        .map(|settings| serde_json::to_string(&*settings).unwrap_or_else(|_| "{}".into()))
-        .unwrap_or_else(|_| "{}".into());
+        .map(|s| s.clone())
+        .unwrap_or_default();
+    let start_url = if initial_settings_struct.disable_home_feed {
+        INSTAGRAM_INBOX
+    } else {
+        INSTAGRAM_HOME
+    };
+    let url = url::Url::parse(start_url).expect("valid Instagram URL");
+    let initial_settings = serde_json::to_string(&initial_settings_struct).unwrap_or_else(|_| "{}".into());
     let dm_monitor_js = include_str!("../generated/dm-monitor.js");
     let instagram_init = format!(
         "window.__INSTADESK_ROLE__ = 'main';\nwindow.__INSTADESK_CONTENT_CONTROLS__ = {initial_settings};\n{dm_monitor_js}"
@@ -453,7 +461,7 @@ fn dispatch_notification<R: Runtime>(
     app: &AppHandle<R>,
     sender: &str,
     preview: &str,
-    destination: &str,
+    _destination: &str,
     kind: &str,
 ) -> Result<(), String> {
     if let Ok(state) = app.notification().permission_state() {
@@ -492,20 +500,6 @@ fn dispatch_notification<R: Runtime>(
     }
 
     let result = builder.show().map_err(|e| e.to_string());
-
-    if !destination.is_empty() && destination != INSTAGRAM_INBOX {
-        let main_win = app.get_window("main");
-        let is_active = main_win
-            .as_ref()
-            .map(|w| w.is_visible().unwrap_or(false) && w.is_focused().unwrap_or(false))
-            .unwrap_or(false);
-        if !is_active {
-            if let Some(instagram) = app.get_webview("instagram") {
-                navigate(&instagram, destination);
-            }
-        }
-    }
-
     result
 }
 
@@ -605,6 +599,16 @@ fn incoming_message(app: AppHandle, webview: Webview, message: InboxMessage) -> 
     if !is_new_message(&state, key) {
         eprintln!("[InstaDesk] duplicate ignored");
         return Ok(());
+    }
+    if !settings.show_notifications_when_open {
+        if let Some(main_win) = app.get_window("main") {
+            let visible = main_win.is_visible().unwrap_or(false);
+            let minimized = main_win.is_minimized().unwrap_or(false);
+            if visible && !minimized {
+                eprintln!("[InstaDesk] notification suppressed because app window is open and visible");
+                return Ok(());
+            }
+        }
     }
     let body = if settings.notification_previews {
         message.preview
@@ -841,24 +845,58 @@ async fn download_media(
     Ok(saved)
 }
 
+fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut map = [255u8; 256];
+    for (i, &b) in TABLE.iter().enumerate() {
+        map[b as usize] = i as u8;
+    }
+    let input = input.trim_end_matches('=');
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0;
+    for &b in input.as_bytes() {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        let val = map[b as usize];
+        if val == 255 {
+            return Err("Invalid base64 character".into());
+        }
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 async fn copy_image(webview: Webview, url: String) -> Result<(), String> {
     if webview.label() != "instagram" {
         return Err("Clipboard copy is available only to the Instagram WebView".into());
     }
-    let target = is_instagram_media_url(&url).ok_or("Rejected non-Instagram media URL")?;
-    let client = media_client()?;
-    let bytes = client
-        .get(target)
-        .header(reqwest::header::REFERER, "https://www.instagram.com/")
-        .send()
-        .await
-        .map_err(|error| format!("Image request failed: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("Image request failed: {error}"))?
-        .bytes()
-        .await
-        .map_err(|error| error.to_string())?;
+    let bytes = if url.starts_with("data:image/") {
+        let comma = url.find(',').ok_or("Invalid data URL format")?;
+        decode_base64(&url[comma + 1..])?
+    } else {
+        let target = is_instagram_media_url(&url).ok_or("Rejected non-Instagram media URL")?;
+        let client = media_client()?;
+        client
+            .get(target)
+            .header(reqwest::header::REFERER, "https://www.instagram.com/")
+            .send()
+            .await
+            .map_err(|error| format!("Image request failed: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("Image request failed: {error}"))?
+            .bytes()
+            .await
+            .map_err(|error| error.to_string())?
+            .to_vec()
+    };
     let image = image::load_from_memory(&bytes)
         .map_err(|error| format!("Could not decode image: {error}"))?
         .to_rgba8();

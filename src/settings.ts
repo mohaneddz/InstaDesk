@@ -15,6 +15,7 @@ interface Settings {
   launchAtStartup: boolean;
   minimizeToTray: boolean;
   notificationPreviews: boolean;
+  showNotificationsWhenOpen: boolean;
   disableHomeFeed: boolean;
   disableReels: boolean;
   disableExplore: boolean;
@@ -40,6 +41,7 @@ app.innerHTML = `
       <label><span><b>Private message notifications</b><small>Show a Windows notification for new 1:1 direct messages.</small></span><input id="notifyPrivate" type="checkbox"><i></i></label>
       <label><span><b>Group message notifications</b><small>Show a Windows notification for new group chat messages.</small></span><input id="notifyGroup" type="checkbox"><i></i></label>
       <label><span><b>Notification previews</b><small>Include message text in notifications.</small></span><input id="notificationPreviews" type="checkbox"><i></i></label>
+      <label><span><b>Show notifications when open</b><small>Show notifications even when InstaDesk is open.</small></span><input id="showNotificationsWhenOpen" type="checkbox"><i></i></label>
       <label><span><b>Minimize to tray</b><small>Keep Instagram running when its window is closed.</small></span><input id="minimizeToTray" type="checkbox"><i></i></label>
       <label><span><b>Launch on startup</b><small>Start InstaDesk quietly with Windows.</small></span><input id="launchAtStartup" type="checkbox"><i></i></label>
     </div>
@@ -98,7 +100,7 @@ const status = document.querySelector<HTMLElement>("#status")!;
 type ToggleKey = { [K in keyof Settings]: Settings[K] extends boolean ? K : never }[keyof Settings];
 
 const keys: ToggleKey[] = [
-  "notifyPrivate", "notifyGroup", "notificationPreviews", "minimizeToTray", "launchAtStartup",
+  "notifyPrivate", "notifyGroup", "notificationPreviews", "showNotificationsWhenOpen", "minimizeToTray", "launchAtStartup",
   "notifyMessages", "notifyReactions", "notifyTyping", "notifyStoryReplies", "notifyNoteReplies", "notifyMutedChats",
   "disableHomeFeed", "disableReels", "disableExplore", "disableSearch",
   "disablePosts", "disableStories", "disableSuggestions", "ghostStories",

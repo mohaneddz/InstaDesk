@@ -115,7 +115,6 @@
   }
   function blockedDestination(pathname, controls, loggedIn = true) {
     if (!loggedIn) return false;
-    if (controls.disableHomeFeed && pathname === "/") return true;
     if (controls.disableReels && /^\/reels?(?:\/|$)/.test(pathname)) return true;
     if (controls.disableSearch && /^\/explore\/search(?:\/|$)/.test(pathname)) return true;
     if (controls.disableExplore && /^\/explore(?:\/|$)/.test(pathname)) return true;
@@ -392,6 +391,30 @@
           const storyLink = main.querySelector('a[href*="/stories/"]') ?? main.querySelector(`[aria-label*="story" i][role="button"], [aria-label$="\u2019s story" i]`);
           if (storyLink) targets.add(enclosingBlock(storyLink, main));
         }
+        if (controls.disablePosts) {
+          const storyLink = main.querySelector('a[href*="/stories/"]');
+          let storyTray = null;
+          if (storyLink) {
+            let curr = storyLink;
+            while (curr && curr !== main && curr.parentElement !== main) {
+              if (curr.getAttribute("role") === "menu" || curr.getAttribute("role") === "list" || /stories/i.test(curr.getAttribute("aria-label") ?? "") || curr.id === "stories") {
+                storyTray = curr;
+                break;
+              }
+              curr = curr.parentElement;
+            }
+            if (!storyTray) storyTray = storyLink.parentElement;
+          }
+          const dialog = win.document.querySelector('div[role="dialog"]');
+          const loaders = main.querySelectorAll(
+            '[data-visualcompletion="loading-state"], svg[aria-label*="Loading" i], [aria-label*="Loading" i], [aria-busy="true"]'
+          );
+          for (const loader of loaders) {
+            if ((!storyTray || !storyTray.contains(loader)) && (!dialog || !dialog.contains(loader)) && !loader.closest('a[href*="/stories/"], div[role="dialog"]')) {
+              targets.add(loader);
+            }
+          }
+        }
         if (controls.disableSuggestions) {
           const headings = [...win.document.querySelectorAll("span,div,h1,h2,h3,h4")].filter((element) => element.childElementCount === 0 && /^Suggested for you$/i.test(normalizedText(element)));
           for (const heading of headings) targets.add(enclosingBlock(heading, main));
@@ -408,6 +431,12 @@
             }
           }
         }
+      }
+      if (controls.ghostStories) {
+        for (const canvas of win.document.querySelectorAll("main canvas, header canvas, [role='menu'] canvas, [role='list'] canvas, a[href*='/stories/'] canvas")) {
+          recolorStoryCanvas(canvas, true);
+        }
+        recolorStorySvg(win.document, true);
       }
       if (controls.hidePrivateChats || controls.hideGroupChats) {
         let hidden = 0;
@@ -430,11 +459,19 @@
     const apply = () => {
       if (!win.document?.documentElement) return;
       const rules = [];
-      if (controls.disableHomeFeed) rules.push('a[href="/"]:has([aria-label="Home"]),a[href="https://www.instagram.com/"]:has([aria-label="Home"])');
       if (controls.disableReels) rules.push('a[href*="/reels"]:has([aria-label="Reels"]),a:has([aria-label="Reels"])');
       if (controls.disableExplore) rules.push('a[href*="/explore"]:has([aria-label="Explore"]),a:has([aria-label="Explore"])');
       if (controls.disableSearch) rules.push('[role="button"]:has([aria-label="Search"]),[role="link"]:has([aria-label="Search"]),a:has([aria-label="Search"])');
-      if (controls.disablePosts) rules.push("main article");
+      if (controls.disablePosts) {
+        rules.push(
+          "main article",
+          'main:not(:has(div[role="dialog"])) [data-instadesk-feed-spinner]',
+          'main [data-visualcompletion="loading-state"]:not(div[role="dialog"] *):not(a[href*="/stories/"] *)',
+          'main svg[aria-label*="Loading" i]:not(div[role="dialog"] *):not(a[href*="/stories/"] *)',
+          'main [aria-label*="Loading" i]:not(div[role="dialog"] *):not(a[href*="/stories/"] *)',
+          'main [data-loading="true"]:not(div[role="dialog"] *):not(a[href*="/stories/"] *)'
+        );
+      }
       if (controls.disableStories) rules.push('main a[href*="/stories/"]');
       if (controls.hidePrivateChats && controls.hideGroupChats) {
         rules.push('a[href*="/direct/t/"]', '[role="listitem"]:has(a[href*="/direct/t/"])');
@@ -635,12 +672,47 @@
     new MutationObserver(enhance).observe(win.document.body, { childList: true, subtree: true });
     enhance();
   }
-  var STORY_SEEN_URL_PATTERN = /stor(y|ies)[_\-/]?(seen|viewed)|reel[_\-/]?(media[_\-/]?)?seen|seen[_\-/]?stor(y|ies)|media\/seen/i;
-  var STORY_SEEN_TOKEN = /(reel|stor(y|ies)|media)[_\-/]?(seen|viewed)|(seen|viewed)[_\-/]?(reel|stor(y|ies)|media|state)|mark[_\-/]?(as[_\-/]?)?seen|seen[_\-/]?mutation|seenmutation/i;
+  var EMPTY_TIMELINE_RESPONSE = {
+    feed_items: [],
+    num_results: 0,
+    more_available: false,
+    auto_load_more_enabled: false,
+    is_direct_styles: false,
+    status: "ok",
+    data: {
+      xdt_api__v1__feed__timeline__connection: {
+        edges: [],
+        page_info: {
+          has_next_page: false,
+          end_cursor: null
+        }
+      }
+    }
+  };
+  var FEED_TIMELINE_URL_PATTERN = /\/api\/v1\/feed\/timeline\/?|\/feed\/timeline\/?/i;
+  var FEED_TIMELINE_TOKEN = /(?:Polaroid|Polaris)?FeedTimeline(?:Query|RootQuery|Pagination)?|xdt_api__v1__feed__timeline|usePolaroidFeedQuery|PolaroidFeedQuery/i;
+  function looksLikeFeedTimelineRequest(url, body, method = "GET") {
+    if (FEED_TIMELINE_URL_PATTERN.test(url)) return true;
+    if (/(?:stories|story|reels|reel|direct|dialog)/i.test(`${url} ${body ?? ""}`)) {
+      return false;
+    }
+    if (FEED_TIMELINE_TOKEN.test(`${url} ${body ?? ""}`)) return true;
+    return false;
+  }
+  function requestOperationName(url, body) {
+    const name = body?.match(/fb_api_req_friendly_name=([^&\s]+)/)?.[1] ?? body?.match(/"?operationName"?\s*[:=]\s*"?([A-Za-z0-9_]+)/)?.[1];
+    return name ?? "";
+  }
+  var STORY_SEEN_URL_PATTERN = /\/(?:stories|reel|media)\/(?:reel_)?seen\/?|seen[_\-/]?(?:stories|reel|media)\/?/i;
+  var STORY_SEEN_MUTATION_TOKEN = /(?:Stories|Reel|Story|Media).*Seen.*Mutation|Seen.*(?:Stories|Reel|Story|Media).*Mutation|useMarkSeenMutation|reel_seen|stories_seen/i;
   function looksLikeStorySeenRequest(url, body, method = "GET") {
     if (STORY_SEEN_URL_PATTERN.test(url)) return true;
     if (method.toUpperCase() === "GET") return false;
-    return STORY_SEEN_TOKEN.test(`${url} ${body ?? ""}`);
+    const opName = requestOperationName(url, body);
+    if (/Query$/i.test(opName) || /PageQuery|ViewerQuery|ReelsMedia|ReelPage/i.test(`${url} ${body ?? ""}`)) {
+      return false;
+    }
+    return STORY_SEEN_MUTATION_TOKEN.test(`${url} ${body ?? ""}`);
   }
   function requestOperation(url, body) {
     const name = body?.match(/fb_api_req_friendly_name=([^&\s]+)/)?.[1] ?? body?.match(/"?operationName"?\s*[:=]\s*"?([A-Za-z0-9_]+)/)?.[1];
@@ -651,10 +723,144 @@
     }
     return name ? `${path} (${name})` : path;
   }
+  function isGreenColor(color) {
+    const c = color.trim().toLowerCase();
+    if (c.includes("green") || c.includes("lime")) return true;
+    if (/^#([0-9a-f]{6}|[0-9a-f]{3}|[0-9a-f]{8})$/i.test(c)) {
+      const hex = c.slice(1);
+      let r = 0, g = 0, b = 0;
+      if (hex.length === 3 || hex.length === 4) {
+        r = parseInt(hex[0] + hex[0], 16);
+        g = parseInt(hex[1] + hex[1], 16);
+        b = parseInt(hex[2] + hex[2], 16);
+      } else {
+        r = parseInt(hex.slice(0, 2), 16);
+        g = parseInt(hex.slice(2, 4), 16);
+        b = parseInt(hex.slice(4, 6), 16);
+      }
+      return g > 100 && g > r * 1.15 && g > b * 1.15;
+    }
+    const rgbMatch = c.match(/rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+    if (rgbMatch) {
+      const r = Number(rgbMatch[1]);
+      const g = Number(rgbMatch[2]);
+      const b = Number(rgbMatch[3]);
+      return g > 100 && g > r * 1.15 && g > b * 1.15;
+    }
+    const hslMatch = c.match(/hsla?\s*\(\s*(\d+)/i);
+    if (hslMatch) {
+      const h = Number(hslMatch[1]);
+      return h >= 80 && h <= 170;
+    }
+    return false;
+  }
+  function isStoryGradientColor(color) {
+    const c = color.trim().toLowerCase();
+    if (isGreenColor(c)) return false;
+    if (c.includes("transparent") || c === "none") return false;
+    if (/^#([0-9a-f]{6}|[0-9a-f]{3}|[0-9a-f]{8})$/i.test(c)) {
+      const hex = c.slice(1);
+      let r = 0, g = 0, b = 0;
+      if (hex.length === 3 || hex.length === 4) {
+        r = parseInt(hex[0] + hex[0], 16);
+        g = parseInt(hex[1] + hex[1], 16);
+        b = parseInt(hex[2] + hex[2], 16);
+      } else {
+        r = parseInt(hex.slice(0, 2), 16);
+        g = parseInt(hex.slice(2, 4), 16);
+        b = parseInt(hex.slice(4, 6), 16);
+      }
+      if (Math.abs(r - g) < 25 && Math.abs(g - b) < 25 && Math.abs(r - b) < 25) return false;
+      return r > 100 || b > 120;
+    }
+    const rgbMatch = c.match(/rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+    if (rgbMatch) {
+      const r = Number(rgbMatch[1]);
+      const g = Number(rgbMatch[2]);
+      const b = Number(rgbMatch[3]);
+      if (Math.abs(r - g) < 25 && Math.abs(g - b) < 25 && Math.abs(r - b) < 25) return false;
+      return r > 100 || b > 120;
+    }
+    const hslMatch = c.match(/hsla?\s*\(\s*(\d+)/i);
+    if (hslMatch) {
+      const h = Number(hslMatch[1]);
+      return h < 80 || h > 170;
+    }
+    return false;
+  }
+  function ghostStoryStopColor(color, offset, kind) {
+    if (kind === "close-friends" || isGreenColor(color)) {
+      if (offset <= 0.3) return "#00c6ff";
+      if (offset <= 0.7) return "#0095f6";
+      return "#0066ff";
+    }
+    if (kind === "default" || isStoryGradientColor(color)) {
+      if (offset <= 0.3) return "#ff758c";
+      if (offset <= 0.7) return "#ff2d75";
+      return "#e1306c";
+    }
+    return color;
+  }
+  function recolorStoryCanvas(canvas, enabled) {
+    if (!enabled) return;
+    try {
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      const { width, height } = canvas;
+      if (width < 20 || height < 20) return;
+      const imgData = ctx.getImageData(0, 0, width, height);
+      const data = imgData.data;
+      let modified = false;
+      for (let i = 0; i < data.length; i += 4) {
+        const a = data[i + 3];
+        if (a < 30) continue;
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+        if (Math.abs(r - g) < 20 && Math.abs(g - b) < 20 && Math.abs(r - b) < 20) continue;
+        if (g > 100 && g > r * 1.15 && g > b * 1.15) {
+          data[i] = 0;
+          data[i + 1] = 149;
+          data[i + 2] = 246;
+          modified = true;
+        } else if (r > 100 || b > 100 && r > g) {
+          data[i] = 255;
+          data[i + 1] = 45;
+          data[i + 2] = 117;
+          modified = true;
+        }
+      }
+      if (modified) {
+        ctx.putImageData(imgData, 0, 0);
+      }
+    } catch {
+    }
+  }
+  function recolorStorySvg(root, enabled) {
+    if (!enabled) return;
+    for (const stop of root.querySelectorAll("stop[stop-color]")) {
+      const color = stop.getAttribute("stop-color") ?? "";
+      const offset = parseFloat(stop.getAttribute("offset") ?? "0");
+      if (isGreenColor(color)) {
+        stop.setAttribute("stop-color", ghostStoryStopColor(color, offset, "close-friends"));
+      } else if (isStoryGradientColor(color)) {
+        stop.setAttribute("stop-color", ghostStoryStopColor(color, offset, "default"));
+      }
+    }
+    for (const circle of root.querySelectorAll("circle[stroke]")) {
+      const stroke = circle.getAttribute("stroke") ?? "";
+      if (isGreenColor(stroke)) {
+        circle.setAttribute("stroke", "#0095f6");
+      } else if (isStoryGradientColor(stroke)) {
+        circle.setAttribute("stroke", "#ff2d75");
+      }
+    }
+  }
   function installGhostStories(win) {
     if (win.__INSTADESK_GHOST__) return;
     win.__INSTADESK_GHOST__ = true;
-    const enabled = () => Boolean(win.__INSTADESK_CONTENT_CONTROLS__?.ghostStories);
+    const enabledGhost = () => Boolean(win.__INSTADESK_CONTENT_CONTROLS__?.ghostStories);
+    const enabledDisablePosts = () => Boolean(win.__INSTADESK_CONTENT_CONTROLS__?.disablePosts);
     let reports = 0;
     const report = (label, detail) => {
       console.debug(`[InstaDesk] ${label}`, detail);
@@ -663,7 +869,7 @@
       });
     };
     const noteNearMiss = (url, body, method) => {
-      if (!enabled() || method.toUpperCase() === "GET") return;
+      if (!enabledGhost() || method.toUpperCase() === "GET") return;
       const haystack = `${url} ${body ?? ""}`;
       if (/stor(y|ies)|reel/i.test(haystack) && /seen|view|impression/i.test(haystack)) {
         report("ghost mode let a story write through", requestOperation(url, body));
@@ -671,18 +877,37 @@
     };
     const nativeFetch = win.fetch.bind(win);
     win.fetch = (async (input, init) => {
+      const raw = typeof input === "string" || input instanceof URL ? input.toString() : input.url;
+      const body = typeof init?.body === "string" ? init.body : void 0;
+      const method = init?.method ?? (typeof input === "object" && "method" in input ? input.method : "GET");
       try {
-        const raw = typeof input === "string" || input instanceof URL ? input.toString() : input.url;
-        const body = typeof init?.body === "string" ? init.body : void 0;
-        const method = init?.method ?? (typeof input === "object" && "method" in input ? input.method : "GET");
-        if (enabled() && looksLikeStorySeenRequest(raw, body, method)) {
+        if (enabledGhost() && looksLikeStorySeenRequest(raw, body, method)) {
           report("ghost mode suppressed a story view receipt", requestOperation(raw, body));
           return new Response(null, { status: 204 });
+        }
+        if (enabledDisablePosts() && looksLikeFeedTimelineRequest(raw, body, method)) {
+          console.debug("[InstaDesk] suppressed timeline feed request because Disable Posts is active", requestOperation(raw, body));
+          return new Response(JSON.stringify(EMPTY_TIMELINE_RESPONSE), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
         }
         noteNearMiss(raw, body, method);
       } catch {
       }
-      return nativeFetch(input, init);
+      const response = await nativeFetch(input, init);
+      try {
+        recordVideoRequest(raw, win);
+        const contentType = response.headers.get("content-type") ?? "";
+        if (contentType.includes("json") || contentType.includes("javascript") || raw.includes("/graphql/") || raw.includes("/api/")) {
+          response.clone().text().then((text) => {
+            cleanAndParseJson(text);
+          }).catch(() => {
+          });
+        }
+      } catch {
+      }
+      return response;
     });
     const XHR = win.XMLHttpRequest.prototype;
     const nativeOpen = XHR.open;
@@ -690,6 +915,7 @@
     XHR.open = function(method, url, ...rest) {
       this.__instadeskUrl = String(url);
       this.__instadeskMethod = method;
+      recordVideoRequest(this.__instadeskUrl, win);
       return nativeOpen.apply(this, [method, url, ...rest]);
     };
     XHR.send = function(body) {
@@ -697,7 +923,7 @@
       const method = this.__instadeskMethod ?? "GET";
       const bodyText = typeof body === "string" ? body : void 0;
       if (url) noteNearMiss(url, bodyText, method);
-      if (enabled() && url && looksLikeStorySeenRequest(url, bodyText, method)) {
+      if (enabledGhost() && url && looksLikeStorySeenRequest(url, bodyText, method)) {
         report("ghost mode suppressed a story view receipt (xhr)", requestOperation(url, bodyText));
         win.setTimeout(() => {
           Object.defineProperty(this, "readyState", { value: 4, configurable: true });
@@ -708,6 +934,26 @@
         }, 0);
         return;
       }
+      if (enabledDisablePosts() && url && looksLikeFeedTimelineRequest(url, bodyText, method)) {
+        console.debug("[InstaDesk] suppressed timeline feed request (xhr) because Disable Posts is active", requestOperation(url, bodyText));
+        win.setTimeout(() => {
+          Object.defineProperty(this, "readyState", { value: 4, configurable: true });
+          Object.defineProperty(this, "status", { value: 200, configurable: true });
+          Object.defineProperty(this, "response", { value: JSON.stringify(EMPTY_TIMELINE_RESPONSE), configurable: true });
+          Object.defineProperty(this, "responseText", { value: JSON.stringify(EMPTY_TIMELINE_RESPONSE), configurable: true });
+          this.dispatchEvent(new Event("readystatechange"));
+          this.dispatchEvent(new Event("load"));
+          this.dispatchEvent(new Event("loadend"));
+        }, 0);
+        return;
+      }
+      this.addEventListener("load", () => {
+        try {
+          const text = this.responseText;
+          if (text) cleanAndParseJson(text);
+        } catch {
+        }
+      });
       return nativeSend.call(this, body);
     };
     const nativeSendBeacon = win.navigator.sendBeacon?.bind(win.navigator);
@@ -715,117 +961,454 @@
       win.navigator.sendBeacon = (url, data) => {
         const urlStr = String(url);
         const bodyText = typeof data === "string" ? data : void 0;
-        if (enabled() && looksLikeStorySeenRequest(urlStr, bodyText, "POST")) {
+        if (enabledGhost() && looksLikeStorySeenRequest(urlStr, bodyText, "POST")) {
           report("ghost mode suppressed a story view receipt (sendBeacon)", requestOperation(urlStr, bodyText));
           return true;
         }
         return nativeSendBeacon(url, data);
       };
     }
+    if (typeof win.CanvasGradient !== "undefined") {
+      const gradProto = win.CanvasGradient.prototype;
+      const nativeAddColorStop = gradProto.addColorStop;
+      gradProto.addColorStop = function(offset, color) {
+        if (enabledGhost()) {
+          if (this.__instadeskKind === void 0) {
+            this.__instadeskKind = isGreenColor(color) ? "close-friends" : isStoryGradientColor(color) ? "default" : void 0;
+          }
+          color = ghostStoryStopColor(color, offset, this.__instadeskKind);
+        }
+        return nativeAddColorStop.call(this, offset, color);
+      };
+    }
+    if (typeof win.CanvasRenderingContext2D !== "undefined") {
+      const ctxProto = win.CanvasRenderingContext2D.prototype;
+      const strokeDesc = Object.getOwnPropertyDescriptor(ctxProto, "strokeStyle") || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(ctxProto), "strokeStyle");
+      if (strokeDesc?.set) {
+        const nativeStrokeSet = strokeDesc.set;
+        Object.defineProperty(ctxProto, "strokeStyle", {
+          ...strokeDesc,
+          set(val) {
+            if (enabledGhost() && typeof val === "string") {
+              if (isGreenColor(val)) val = "#0095f6";
+              else if (isStoryGradientColor(val)) val = "#ff2d75";
+            }
+            return nativeStrokeSet.call(this, val);
+          }
+        });
+      }
+    }
+  }
+  var userStoryReels = /* @__PURE__ */ new Map();
+  var storyItemMap = /* @__PURE__ */ new Map();
+  var userVideoUrls = /* @__PURE__ */ new Map();
+  function recordVideoRequest(url, win) {
+    if (!url || !/\.mp4(\?|$)|cdninstagram\.com\/o1\/v\/|fbcdn\.net\/v\//i.test(url)) return;
+    const username = win ? getFocusedUsername(win, getCenteredStoryContainer(win)) : "";
+    if (username) {
+      let list = userVideoUrls.get(username);
+      if (!list) {
+        list = [];
+        userVideoUrls.set(username, list);
+      }
+      if (!list.includes(url)) {
+        list.push(url);
+        if (list.length > 5) list.shift();
+      }
+    }
+  }
+  function cleanAndParseJson(rawText) {
+    if (!rawText) return;
+    let clean = rawText.trim();
+    if (clean.startsWith("for (;;);")) clean = clean.slice(9).trim();
+    else if (clean.startsWith("while(1);")) clean = clean.slice(9).trim();
+    if (clean.startsWith("{") || clean.startsWith("[")) {
+      try {
+        const json = JSON.parse(clean);
+        extractStoryMediaFromJson(json);
+        return;
+      } catch {
+      }
+    }
+    for (const line of clean.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          extractStoryMediaFromJson(parsed);
+        } catch {
+        }
+      }
+    }
+  }
+  function extractStoryMediaFromJson(data, inheritedUsername, depth = 0) {
+    if (!data || typeof data !== "object" || depth > 20) return;
+    if (Array.isArray(data)) {
+      for (const el of data) extractStoryMediaFromJson(el, inheritedUsername, depth + 1);
+      return;
+    }
+    const username = (data.user?.username ?? data.owner?.username ?? data.username ?? inheritedUsername ?? "").toLowerCase();
+    if (Array.isArray(data.items) && data.items.length > 0 && username) {
+      const genuineItems = [];
+      for (const rawItem of data.items) {
+        if (!rawItem || typeof rawItem !== "object") continue;
+        const id = String(rawItem.pk ?? rawItem.id ?? rawItem.code ?? "").toLowerCase();
+        if (!id) continue;
+        const isVideo = rawItem.media_type === 2 || Array.isArray(rawItem.video_versions) && rawItem.video_versions.length > 0 || Array.isArray(rawItem.video_resources) && rawItem.video_resources.length > 0 || typeof rawItem.video_url === "string";
+        const videoUrl = Array.isArray(rawItem.video_versions) && rawItem.video_versions[0]?.url || Array.isArray(rawItem.video_resources) && rawItem.video_resources[0]?.src || typeof rawItem.video_url === "string" && rawItem.video_url || void 0;
+        const imageUrl = Array.isArray(rawItem.image_versions2?.candidates) && rawItem.image_versions2.candidates[0]?.url || typeof rawItem.display_url === "string" && rawItem.display_url || typeof rawItem.thumbnail_src === "string" && rawItem.thumbnail_src || void 0;
+        const kind = isVideo && videoUrl ? "video" : "image";
+        const url = (kind === "video" ? videoUrl : imageUrl) ?? imageUrl ?? videoUrl;
+        if (url && /^https?:/i.test(url)) {
+          const storyItem = {
+            id,
+            pk: String(rawItem.pk ?? id).toLowerCase(),
+            code: rawItem.code,
+            username,
+            kind,
+            url,
+            thumbUrl: imageUrl
+          };
+          const existingIdx = genuineItems.findIndex((x) => x.id === id || storyItem.pk && x.pk === storyItem.pk);
+          if (existingIdx >= 0) {
+            genuineItems[existingIdx] = storyItem;
+          } else {
+            genuineItems.push(storyItem);
+          }
+          storyItemMap.set(id, storyItem);
+          if (rawItem.id) storyItemMap.set(String(rawItem.id).toLowerCase(), storyItem);
+          if (rawItem.pk) storyItemMap.set(String(rawItem.pk).toLowerCase(), storyItem);
+          if (rawItem.code) storyItemMap.set(String(rawItem.code).toLowerCase(), storyItem);
+        }
+      }
+      if (genuineItems.length > 0) {
+        userStoryReels.set(username, genuineItems);
+      }
+    }
+    if ((data.id || data.pk) && (data.video_versions || data.image_versions2 || data.display_url || data.video_url)) {
+      const id = String(data.pk ?? data.id ?? data.code ?? "").toLowerCase();
+      const isVideo = data.media_type === 2 || Array.isArray(data.video_versions) && data.video_versions.length > 0 || Array.isArray(data.video_resources) && data.video_resources.length > 0 || typeof data.video_url === "string";
+      const videoUrl = Array.isArray(data.video_versions) && data.video_versions[0]?.url || Array.isArray(data.video_resources) && data.video_resources[0]?.src || typeof data.video_url === "string" && data.video_url || void 0;
+      const imageUrl = Array.isArray(data.image_versions2?.candidates) && data.image_versions2.candidates[0]?.url || typeof data.display_url === "string" && data.display_url || typeof data.thumbnail_src === "string" && data.thumbnail_src || void 0;
+      const kind = isVideo && videoUrl ? "video" : "image";
+      const url = (kind === "video" ? videoUrl : imageUrl) ?? imageUrl ?? videoUrl;
+      if (url && /^https?:/i.test(url) && id) {
+        const storyItem = {
+          id,
+          pk: String(data.pk ?? id).toLowerCase(),
+          code: data.code,
+          username,
+          kind,
+          url,
+          thumbUrl: imageUrl
+        };
+        storyItemMap.set(id, storyItem);
+        if (data.id) storyItemMap.set(String(data.id).toLowerCase(), storyItem);
+        if (data.pk) storyItemMap.set(String(data.pk).toLowerCase(), storyItem);
+        if (data.code) storyItemMap.set(String(data.code).toLowerCase(), storyItem);
+        if (username) {
+          let reel = userStoryReels.get(username);
+          if (!reel) {
+            reel = [];
+            userStoryReels.set(username, reel);
+          }
+          const existingIdx = reel.findIndex((x) => x.id === id || storyItem.pk && x.pk === storyItem.pk);
+          if (existingIdx >= 0) {
+            reel[existingIdx] = storyItem;
+          } else {
+            reel.push(storyItem);
+          }
+        }
+      }
+    }
+    for (const key of Object.keys(data)) {
+      if (key === "video_versions" || key === "image_versions2" || key === "candidates" || key === "video_resources" || key === "__proto__" || key === "constructor") {
+        continue;
+      }
+      extractStoryMediaFromJson(data[key], username, depth + 1);
+    }
+  }
+  function scanObjectForMedia(obj, depth = 0) {
+    if (!obj || depth > 12 || typeof obj !== "object") return null;
+    if (Array.isArray(obj.video_versions) && obj.video_versions[0]?.url) {
+      return {
+        videoUrl: obj.video_versions[0].url,
+        imageUrl: obj.image_versions2?.candidates?.[0]?.url
+      };
+    }
+    if (Array.isArray(obj.video_resources) && obj.video_resources[0]?.src) {
+      return { videoUrl: obj.video_resources[0].src, imageUrl: obj.display_url };
+    }
+    if (typeof obj.videoUrl === "string" && /^https?:/i.test(obj.videoUrl)) {
+      return { videoUrl: obj.videoUrl, imageUrl: obj.imageUrl };
+    }
+    if (typeof obj.video_url === "string" && /^https?:/i.test(obj.video_url)) {
+      return { videoUrl: obj.video_url, imageUrl: obj.display_url };
+    }
+    if (typeof obj.playback_url === "string" && /^https?:/i.test(obj.playback_url)) {
+      return { videoUrl: obj.playback_url };
+    }
+    if (typeof obj.src === "string" && /\.mp4(\?|$)/i.test(obj.src)) {
+      return { videoUrl: obj.src };
+    }
+    if (typeof obj.url === "string" && /\.mp4(\?|$)/i.test(obj.url)) {
+      return { videoUrl: obj.url };
+    }
+    for (const prop of ["item", "story", "media", "entry", "node", "reel", "memoizedProps", "pendingProps", "stateNode", "child", "sibling", "return"]) {
+      if (obj[prop]) {
+        const res = scanObjectForMedia(obj[prop], depth + 1);
+        if (res) return res;
+      }
+    }
+    return null;
+  }
+  function extractMediaFromFiber(el) {
+    if (!el) return null;
+    for (const key in el) {
+      if (key.startsWith("__reactFiber$") || key.startsWith("__reactProps$")) {
+        const fiber = el[key];
+        const res = scanObjectForMedia(fiber, 0);
+        if (res) return res;
+      }
+    }
+    return null;
   }
   function sleep(win, ms) {
     return new Promise((resolve) => win.setTimeout(resolve, ms));
   }
-  function storyDialog(win) {
-    return win.document.querySelector('div[role="dialog"]');
-  }
-  function storySegmentCount(dialog) {
-    return dialog.querySelectorAll('[role="progressbar"]').length;
-  }
-  function storyControlButton(dialog, label) {
-    for (const button of dialog.querySelectorAll('button,[role="button"]')) {
-      if (label.test(button.getAttribute("aria-label") ?? "")) return button;
+  function isViewingStory(win) {
+    const pathname = win.location?.pathname ?? "";
+    if (/^\/stories\//.test(pathname)) return true;
+    const dialog = win.document.querySelector('div[role="dialog"]');
+    if (dialog && (dialog.querySelector("video, img") || dialog.querySelector('[role="progressbar"]') || /story/i.test(dialog.getAttribute("aria-label") ?? ""))) {
+      return true;
     }
-    return null;
+    return false;
+  }
+  function storyContainer(win) {
+    const dialog = win.document.querySelector('div[role="dialog"]');
+    if (dialog) return dialog;
+    return win.document.querySelector("main section, main") ?? win.document.body;
+  }
+  function getCenteredStoryContainer(win) {
+    const dialog = win.document.querySelector('div[role="dialog"]');
+    if (dialog) return dialog;
+    const candidates = [...win.document.querySelectorAll("section, main > div, div:has(> video)")];
+    const centerX = win.innerWidth / 2;
+    let closest = null;
+    let minDiff = Infinity;
+    for (const cand of candidates) {
+      const rect = cand.getBoundingClientRect();
+      if (rect.width > 200 && rect.height > 300) {
+        const candCenter = rect.left + rect.width / 2;
+        const diff = Math.abs(candCenter - centerX);
+        if (diff < minDiff) {
+          minDiff = diff;
+          closest = cand;
+        }
+      }
+    }
+    return closest ?? win.document.querySelector("main section, main") ?? win.document.body;
+  }
+  function getFocusedUsername(win, root) {
+    const pathname = win.location?.pathname ?? "";
+    const match = pathname.match(/\/stories\/([^\/]+)(?:\/(\d+))?/i);
+    const urlUser = match?.[1]?.toLowerCase();
+    const headerLink = root?.querySelector?.('header a[href*="/"]');
+    const domUser = headerLink?.getAttribute("href")?.replace(/^\/|\/$/g, "").split("/")[0]?.toLowerCase();
+    return (domUser || urlUser || "").toLowerCase();
+  }
+  function getActiveSegmentIndex(win, root) {
+    const progressBars = [...root.querySelectorAll('[role="progressbar"], header > div > div > div')];
+    if (!progressBars.length) return 0;
+    for (let i = 0; i < progressBars.length; i++) {
+      const bar = progressBars[i];
+      const val = bar.getAttribute("aria-valuenow");
+      if (val && Number(val) > 0 && Number(val) < 100) return i;
+      const inner = bar.firstElementChild;
+      if (inner) {
+        const style = win.getComputedStyle(inner);
+        const transform = style.transform;
+        if (transform && transform !== "none" && !transform.includes("matrix(1, 0, 0, 1, 0, 0)")) {
+          return i;
+        }
+        const width = inner.style.width;
+        if (width && width !== "0%" && width !== "100%") return i;
+      }
+    }
+    return 0;
   }
   function isVisible(win, element) {
     const rect = element.getBoundingClientRect();
-    if (rect.width < 50 || rect.height < 50) return false;
-    if (element.closest('[aria-hidden="true"]')) return false;
+    if (rect.width < 30 || rect.height < 30) return false;
     const style = win.getComputedStyle(element);
     return style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity || "1") > 0.05;
   }
-  function activeStoryMedia(win, dialog) {
-    const video = [...dialog.querySelectorAll("video")].find((el) => isVisible(win, el));
-    if (video) {
-      const url2 = video.currentSrc || video.src;
-      return url2 ? { kind: "video", url: url2 } : null;
+  async function activeStoryMedia(win, root) {
+    const pathname = win.location?.pathname ?? "";
+    const match = pathname.match(/\/stories\/([^\/]+)(?:\/(\d+))?/i);
+    const urlStoryId = match?.[2]?.toLowerCase();
+    if (urlStoryId && storyItemMap.has(urlStoryId)) {
+      const item = storyItemMap.get(urlStoryId);
+      return { kind: item.kind, url: item.url };
     }
-    const image = [...dialog.querySelectorAll("img")].filter((el) => Math.max(el.naturalWidth, el.width) > 200).find((el) => isVisible(win, el));
-    if (!image) return null;
-    const url = image.currentSrc || image.src;
-    return url ? { kind: "image", url } : null;
+    const container = getCenteredStoryContainer(win);
+    const username = getFocusedUsername(win, container);
+    if (username && userStoryReels.has(username)) {
+      const reel = userStoryReels.get(username);
+      if (reel.length > 0) {
+        if (urlStoryId) {
+          const found = reel.find((x) => x.id === urlStoryId || x.pk === urlStoryId);
+          if (found) return { kind: found.kind, url: found.url };
+        }
+        const segIndex = getActiveSegmentIndex(win, container);
+        const safeIndex = Math.min(Math.max(0, segIndex), reel.length - 1);
+        const item = reel[safeIndex];
+        if (item) return { kind: item.kind, url: item.url };
+      }
+    }
+    const centerVideo = container.querySelector("video") ?? win.document.querySelector("video");
+    if (centerVideo) {
+      const fiberMedia = extractMediaFromFiber(centerVideo) ?? extractMediaFromFiber(centerVideo.parentElement) ?? extractMediaFromFiber(container);
+      if (fiberMedia?.videoUrl && /^https?:/i.test(fiberMedia.videoUrl)) {
+        return { kind: "video", url: fiberMedia.videoUrl };
+      }
+      for (const source of centerVideo.querySelectorAll("source")) {
+        if (source.src && /^https?:/i.test(source.src)) return { kind: "video", url: source.src };
+      }
+      if (centerVideo.src && /^https?:/i.test(centerVideo.src)) return { kind: "video", url: centerVideo.src };
+      if (centerVideo.currentSrc && /^https?:/i.test(centerVideo.currentSrc)) return { kind: "video", url: centerVideo.currentSrc };
+    }
+    const centerImg = container.querySelector("img");
+    if (centerImg && Math.max(centerImg.naturalWidth, centerImg.width, centerImg.getBoundingClientRect().width) > 160) {
+      const fiberMedia = extractMediaFromFiber(centerImg);
+      if (fiberMedia?.imageUrl) return { kind: "image", url: fiberMedia.imageUrl };
+      const srcset = centerImg.getAttribute("srcset");
+      if (srcset) {
+        const parts = srcset.split(",").map((s) => s.trim().split(/\s+/));
+        const highest = parts[parts.length - 1]?.[0];
+        if (highest && /^https?:/i.test(highest)) return { kind: "image", url: highest };
+      }
+      const url = centerImg.currentSrc || centerImg.src;
+      if (url && /^https?:/i.test(url)) return { kind: "image", url };
+    }
+    if (username && userVideoUrls.has(username)) {
+      const list = userVideoUrls.get(username);
+      if (list.length > 0) return { kind: "video", url: list[list.length - 1] };
+    }
+    if (centerVideo?.poster && /^https?:/i.test(centerVideo.poster)) {
+      return { kind: "image", url: centerVideo.poster };
+    }
+    return null;
   }
-  async function waitForActiveStoryMedia(win, dialog, timeoutMs = 1500) {
+  async function waitForActiveStoryMedia(win, root, timeoutMs = 1500) {
     const start = Date.now();
-    let media = activeStoryMedia(win, dialog);
+    let media = await activeStoryMedia(win, root);
     while (!media && Date.now() - start < timeoutMs) {
       await sleep(win, 90);
-      media = activeStoryMedia(win, dialog);
+      media = await activeStoryMedia(win, root);
     }
     return media;
   }
-  async function downloadActiveStory(win, dialog, onProgress) {
-    const media = activeStoryMedia(win, dialog);
-    if (!media || !/^https?:/i.test(media.url)) throw new Error("No downloadable story media found");
-    return invokeDownload([media], "instagram-story", onProgress);
+  async function downloadActiveStory(win, root, onProgress) {
+    const container = getCenteredStoryContainer(win);
+    const username = getFocusedUsername(win, container) || "instagram";
+    const media = await waitForActiveStoryMedia(win, container, 2e3);
+    if (!media || !/^https?:/i.test(media.url)) throw new Error("No downloadable story media found for " + username);
+    return invokeDownload([media], `${username}-story`, onProgress);
   }
-  async function copyActiveStory(win, dialog) {
-    const media = activeStoryMedia(win, dialog);
-    if (!media || media.kind !== "image") throw new Error("This story has no copyable image");
-    await invoke("copy_image", { url: media.url });
-  }
-  async function downloadAllStories(win, dialog, onProgress) {
-    const total = storySegmentCount(dialog);
-    if (!total) throw new Error("Could not detect story segments");
-    const collected = [];
-    let steppedForward = 0;
-    try {
-      for (let index = 0; index < total; index++) {
-        const media = await waitForActiveStoryMedia(win, dialog);
-        if (media && /^https?:/i.test(media.url) && !collected.some((item) => item.url === media.url)) collected.push(media);
-        onProgress((index + 1) / total * 50);
-        if (index < total - 1) {
-          const next = storyControlButton(dialog, /^next$/i);
-          if (!next) break;
-          next.click();
-          steppedForward++;
-          await sleep(win, 260);
+  async function copyActiveStory(win, root) {
+    const container = getCenteredStoryContainer(win);
+    const video = container.querySelector("video") ?? win.document.querySelector("video");
+    if (video && isVisible(win, video)) {
+      try {
+        const canvas = win.document.createElement("canvas");
+        canvas.width = video.videoWidth || video.clientWidth || 1080;
+        canvas.height = video.videoHeight || video.clientHeight || 1920;
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const dataUrl = canvas.toDataURL("image/png");
+          if (dataUrl && dataUrl.startsWith("data:image/png;base64,")) {
+            await invoke("copy_image", { url: dataUrl });
+            return;
+          }
         }
-      }
-    } finally {
-      const previous = storyControlButton(dialog, /^(previous|go back)$/i);
-      for (let index = 0; index < steppedForward; index++) {
-        previous?.click();
-        await sleep(win, 120);
+      } catch (error) {
+        console.warn("[InstaDesk] canvas video frame copy fallback", error);
       }
     }
-    if (!collected.length) throw new Error("No downloadable story media found");
-    return invokeDownload(collected, "instagram-story", (percent) => onProgress(50 + percent / 2));
+    const media = await waitForActiveStoryMedia(win, container, 1500);
+    if (!media) throw new Error("No story media found to copy");
+    if (media.kind === "video") {
+      const poster = video?.poster;
+      if (poster && /^https?:/i.test(poster)) {
+        await invoke("copy_image", { url: poster });
+        return;
+      }
+      throw new Error("Cannot copy video to clipboard as image");
+    }
+    await invoke("copy_image", { url: media.url });
+  }
+  async function downloadAllStories(win, root, onProgress) {
+    const container = getCenteredStoryContainer(win);
+    const username = getFocusedUsername(win, container);
+    if (!username) throw new Error("Could not detect focused story user");
+    const reel = userStoryReels.get(username);
+    if (reel && reel.length > 0) {
+      const uniqueItems = [];
+      const seenIds = /* @__PURE__ */ new Set();
+      const seenUrls = /* @__PURE__ */ new Set();
+      for (const item of reel) {
+        if (!seenIds.has(item.id) && !seenUrls.has(item.url)) {
+          seenIds.add(item.id);
+          seenUrls.add(item.url);
+          uniqueItems.push({ kind: item.kind, url: item.url });
+        }
+      }
+      if (uniqueItems.length > 0) {
+        return invokeDownload(uniqueItems, `${username}-story`, onProgress);
+      }
+    }
+    const current = await waitForActiveStoryMedia(win, container, 1500);
+    if (!current) throw new Error("No downloadable stories found for " + username);
+    return invokeDownload([current], `${username}-story`, onProgress);
   }
   function installStoryMediaActions(win) {
     if (win.__INSTADESK_STORY_ACTIONS__) return;
     win.__INSTADESK_STORY_ACTIONS__ = true;
+    let host = null;
     const enhance = () => {
-      const dialog = storyDialog(win);
-      if (!dialog || dialog.dataset.instadeskStoryActions !== void 0 || !storySegmentCount(dialog)) return;
-      dialog.dataset.instadeskStoryActions = "";
-      if (win.getComputedStyle(dialog).position === "static") dialog.style.setProperty("position", "relative");
-      const host = win.document.createElement("div");
-      host.style.cssText = "position:absolute;left:12px;bottom:16px;z-index:1000;display:block";
+      const active = isViewingStory(win);
+      if (!active) {
+        if (host) {
+          host.remove();
+          host = null;
+        }
+        return;
+      }
+      if (host && win.document.body.contains(host)) return;
+      host = win.document.createElement("div");
+      host.id = "instadesk-story-actions-host";
+      host.style.cssText = "position:fixed;left:24px;bottom:28px;z-index:2147483647;display:block;";
       const root = host.attachShadow({ mode: "closed" });
       root.innerHTML = `<style>
-      .actions{display:flex;gap:6px;padding:5px;border:1px solid #ffffff24;border-radius:10px;background:#111115e8;box-shadow:0 4px 18px #0008;backdrop-filter:blur(10px)}
-      button{position:relative;width:30px;height:30px;display:grid;place-items:center;padding:0;border:0;border-radius:7px;background:transparent;color:#eee;cursor:pointer}button:hover{background:#ffffff18}button:active{background:#ffffff26}button:disabled{cursor:progress}
-      svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.ok{color:#6fd58a}.error{color:#ff7676}
-      .ring{position:absolute;inset:1px;border-radius:6px;display:none;place-items:center;background:conic-gradient(#b64bd0 calc(var(--pct,0)*1%),#ffffff22 0)}
-      .ring::after{content:"";position:absolute;inset:2px;border-radius:5px;background:#141418}
-      .pct{position:relative;font:600 9px "Segoe UI",sans-serif;color:#f0f0f3}
+      .actions{display:flex;gap:8px;padding:7px;border:1px solid rgba(255,255,255,.22);border-radius:14px;background:rgba(18,18,24,.88);box-shadow:0 10px 32px rgba(0,0,0,.6);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}
+      button{position:relative;width:36px;height:36px;display:grid;place-items:center;padding:0;border:0;border-radius:10px;background:rgba(255,255,255,.1);color:#f5f5f7;cursor:pointer;transition:all .15s ease}
+      button:hover{background:rgba(255,255,255,.22);transform:scale(1.08);color:#fff}
+      button:active{background:rgba(255,255,255,.32);transform:scale(.95)}
+      button:disabled{cursor:progress}
+      svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+      .ok{color:#52e080!important;background:rgba(82,224,128,.2)!important}
+      .error{color:#ff6b6b!important;background:rgba(255,107,107,.2)!important}
+      .ring{position:absolute;inset:2px;border-radius:8px;display:none;place-items:center;background:conic-gradient(#b64bd0 calc(var(--pct,0)*1%),rgba(255,255,255,.2) 0)}
+      .ring::after{content:"";position:absolute;inset:2px;border-radius:6px;background:#14141a}
+      .pct{position:relative;font:600 10px "Segoe UI",sans-serif;color:#f0f0f3}
       button.busy .ring{display:grid}button.busy svg{visibility:hidden}
     </style><div class="actions">
-      <button data-action="copy" title="Copy story image" aria-label="Copy story image"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg><span class="ring"><span class="pct">0</span></span></button>
-      <button data-action="download" title="Download this story" aria-label="Download this story"><svg viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M5 20h14"/></svg><span class="ring"><span class="pct">0</span></span></button>
-      <button data-action="downloadAll" title="Download all stories" aria-label="Download all stories"><svg viewBox="0 0 24 24"><path d="M7 3v10m-4-4 4 4 4-4M17 3v10m-4-4 4 4 4-4M5 20h14"/></svg><span class="ring"><span class="pct">0</span></span></button>
+      <button data-action="download" title="Download story (video/photo)" aria-label="Download story"><svg viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M5 20h14"/></svg><span class="ring"><span class="pct">0</span></span></button>
+      <button data-action="copy" title="Copy story image to clipboard" aria-label="Copy story image"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg><span class="ring"><span class="pct">0</span></span></button>
+      <button data-action="downloadAll" title="Download all stories in this tray" aria-label="Download all stories"><svg viewBox="0 0 24 24"><path d="M7 3v10m-4-4 4 4 4-4M17 3v10m-4-4 4 4 4-4M5 20h14"/></svg><span class="ring"><span class="pct">0</span></span></button>
     </div>`;
       root.querySelectorAll("button").forEach((button) => {
         const ring = button.querySelector(".ring");
@@ -841,13 +1424,17 @@
           button.disabled = true;
           button.className = "";
           try {
-            if (button.dataset.action === "copy") {
-              await copyActiveStory(win, dialog);
+            const container = storyContainer(win);
+            if (button.dataset.action === "download") {
+              setProgress(0);
+              button.classList.add("busy");
+              await downloadActiveStory(win, container, setProgress);
+            } else if (button.dataset.action === "copy") {
+              await copyActiveStory(win, container);
             } else {
               setProgress(0);
               button.classList.add("busy");
-              if (button.dataset.action === "download") await downloadActiveStory(win, dialog, setProgress);
-              else await downloadAllStories(win, dialog, setProgress);
+              await downloadAllStories(win, container, setProgress);
             }
             button.classList.remove("busy");
             button.classList.add("ok");
@@ -863,9 +1450,10 @@
           }
         }, true);
       });
-      dialog.append(host);
+      win.document.body.append(host);
     };
     new MutationObserver(enhance).observe(win.document.body, { childList: true, subtree: true });
+    win.addEventListener("popstate", enhance);
     enhance();
   }
   function installInboxMonitor(win) {
@@ -932,6 +1520,7 @@
   }
   if (typeof window !== "undefined" && location.hostname.endsWith("instagram.com")) {
     installRemoteIpcFallback(window);
+    installGhostStories(window);
     if (window.__INSTADESK_ROLE__ === "inbox") {
       const start = () => installInboxMonitor(window);
       if (document.body) start();
@@ -943,7 +1532,6 @@
         installGhostStories(window);
         installPostMediaActions(window);
         installStoryMediaActions(window);
-        installInboxMonitor(window);
       };
       if (document.body) installPageFeatures();
       else document.addEventListener("DOMContentLoaded", installPageFeatures, { once: true });

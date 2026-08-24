@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { blockedDestination, classifyThread, inboxEventKind, inboxRowKind, inboxRowMuted, looksLikeStorySeenRequest, installContentControls, installNavigationShortcuts, parseInboxList, postMediaSources, threadIdFromPath } from "./dm-monitor";
+import { activeStoryMedia, blockedDestination, classifyThread, cleanAndParseJson, downloadAllStories, EMPTY_TIMELINE_RESPONSE, extractMediaFromFiber, extractStoryMediaFromJson, ghostStoryStopColor, inboxEventKind, inboxRowKind, inboxRowMuted, isGreenColor, isStoryGradientColor, looksLikeFeedTimelineRequest, looksLikeStorySeenRequest, installContentControls, installNavigationShortcuts, parseInboxList, postMediaSources, recolorStorySvg, recordVideoRequest, storyItemMap, userStoryReels, threadIdFromPath } from "./dm-monitor";
 
 function page(header: string, rows: string): Document {
   document.body.innerHTML = `<main><header>${header}</header><section>${rows}</section></main>`;
@@ -149,7 +149,7 @@ describe("content controls", () => {
     hidePrivateChats: false, hideGroupChats: false
   };
   it("blocks selected distraction routes", () => {
-    expect(blockedDestination("/", controls)).toBe(true);
+    expect(blockedDestination("/", controls)).toBe(false);
     expect(blockedDestination("/reels/abc/", controls)).toBe(true);
     expect(blockedDestination("/explore/", controls)).toBe(true);
     expect(blockedDestination("/explore/search/", controls)).toBe(true);
@@ -170,14 +170,34 @@ describe("content controls", () => {
     await Promise.resolve();
 
     const rules = document.querySelector<HTMLStyleElement>("#instadesk-content-controls")!.textContent;
-    expect(rules).toContain('aria-label="Home"');
     expect(rules).toContain('aria-label="Reels"');
     expect(rules).toContain('aria-label="Explore"');
     expect(rules).toContain('aria-label="Search"');
     expect(rules).toContain("main article");
+    expect(rules).toContain('main [data-visualcompletion="loading-state"]');
+    expect(rules).toContain('main [aria-label*="Loading" i]');
     expect(document.querySelector<HTMLElement>("#stories")!.style.display).toBe("none");
     expect(document.querySelector<HTMLElement>("#suggestions")!.style.display).toBe("none");
     expect(document.querySelector<HTMLElement>("#feed")!.style.marginLeft).toBe("auto");
+  });
+  it("hides feed loading spinners when disablePosts is active while leaving stories intact", async () => {
+    document.body.innerHTML = `<main>
+      <section id="feed">
+        <div id="stories"><a href="/stories/a/"></a></div>
+        <div id="feed-spinner" role="progressbar" aria-label="Loading..."></div>
+        <div id="loading-state" data-visualcompletion="loading-state"></div>
+      </section>
+    </main>`;
+    const postsDisabledControls = { ...controls, disableStories: false, disablePosts: true };
+    window.__INSTADESK_CONTENT_CONTROLS__ = postsDisabledControls;
+    window.__TAURI_INTERNALS__ = { invoke: async () => postsDisabledControls };
+    delete window.__INSTADESK_CONTROLS__;
+    installContentControls(window);
+    await Promise.resolve();
+
+    expect(document.querySelector<HTMLElement>("#feed-spinner")!.style.display).toBe("none");
+    expect(document.querySelector<HTMLElement>("#loading-state")!.style.display).toBe("none");
+    expect(document.querySelector<HTMLElement>("#stories")!.style.display).not.toBe("none");
   });
   it("hides private inbox rows while leaving group rows visible", async () => {
     document.body.innerHTML = `<main>
@@ -350,8 +370,75 @@ describe("ghost story viewer", () => {
 
   it("leaves reads and unrelated writes alone", () => {
     expect(looksLikeStorySeenRequest("/graphql/query", "fb_api_req_friendly_name=PolarisStoriesV3ReelPageQuery&seen_state=1", "GET")).toBe(false);
+    expect(looksLikeStorySeenRequest("/graphql/query", "fb_api_req_friendly_name=PolarisStoriesV3ReelPageQuery&variables={\"include_seen_state\":true}", "POST")).toBe(false);
+    expect(looksLikeStorySeenRequest("/graphql/query", "fb_api_req_friendly_name=PolarisStoriesViewerRootQuery", "POST")).toBe(false);
     expect(looksLikeStorySeenRequest("/api/v1/feed/timeline/", "reason=cold_start", "POST")).toBe(false);
     expect(looksLikeStorySeenRequest("/api/v1/direct_v2/threads/1/items/", "text=hey", "POST")).toBe(false);
+  });
+
+  it("classifies close friends green colors vs default story gradient colors", () => {
+    // Close friends green
+    expect(isGreenColor("#25b94d")).toBe(true);
+    expect(isGreenColor("#16c60c")).toBe(true);
+    expect(isGreenColor("rgb(37, 185, 77)")).toBe(true);
+    expect(isStoryGradientColor("#25b94d")).toBe(false);
+
+    // Default story gradient colors (orange, red, purple, magenta)
+    expect(isStoryGradientColor("#f09433")).toBe(true);
+    expect(isStoryGradientColor("#dc2743")).toBe(true);
+    expect(isStoryGradientColor("#bc1888")).toBe(true);
+    expect(isGreenColor("#f09433")).toBe(false);
+
+    // Viewed story gray is ignored
+    expect(isGreenColor("#8e8e8e")).toBe(false);
+    expect(isStoryGradientColor("#8e8e8e")).toBe(false);
+  });
+
+  it("transforms default gradient to pink and close friends green to blue", () => {
+    // Default gradient stops -> Pink
+    expect(ghostStoryStopColor("#f09433", 0.1)).toBe("#ff758c");
+    expect(ghostStoryStopColor("#dc2743", 0.5)).toBe("#ff2d75");
+    expect(ghostStoryStopColor("#bc1888", 0.9)).toBe("#e1306c");
+
+    // Close friends green stops -> Blue
+    expect(ghostStoryStopColor("#25b94d", 0.1)).toBe("#00c6ff");
+    expect(ghostStoryStopColor("#16c60c", 0.5)).toBe("#0095f6");
+    expect(ghostStoryStopColor("#00ba34", 0.9)).toBe("#0066ff");
+  });
+
+  it("recolors SVG story rings to pink (default) and blue (close friends)", () => {
+    const container = document.createElement("div");
+    container.innerHTML = `
+      <svg id="default-story"><linearGradient><stop stop-color="#f09433" offset="0"></stop><stop stop-color="#dc2743" offset="1"></stop></linearGradient><circle stroke="#dc2743"></circle></svg>
+      <svg id="cf-story"><linearGradient><stop stop-color="#25b94d" offset="0"></stop></linearGradient><circle stroke="#25b94d"></circle></svg>
+    `;
+    recolorStorySvg(container, true);
+
+    expect(container.querySelector("#default-story circle")!.getAttribute("stroke")).toBe("#ff2d75");
+    expect(container.querySelector("#cf-story circle")!.getAttribute("stroke")).toBe("#0095f6");
+    expect(container.querySelector("#default-story stop")!.getAttribute("stop-color")).toBe("#ff758c");
+    expect(container.querySelector("#cf-story stop")!.getAttribute("stop-color")).toBe("#00c6ff");
+  });
+});
+
+describe("feed timeline suppression", () => {
+  it("detects feed timeline requests across REST and GraphQL", () => {
+    expect(looksLikeFeedTimelineRequest("/api/v1/feed/timeline/")).toBe(true);
+    expect(looksLikeFeedTimelineRequest("/graphql/query", "fb_api_req_friendly_name=PolaroidFeedQuery")).toBe(true);
+    expect(looksLikeFeedTimelineRequest("/graphql/query", "fb_api_req_friendly_name=usePolaroidFeedQuery")).toBe(true);
+    expect(looksLikeFeedTimelineRequest("/graphql/query", "doc_id=123&fb_api_req_friendly_name=FeedTimelineQuery")).toBe(true);
+  });
+
+  it("leaves stories, reels tray, and direct message requests alone", () => {
+    expect(looksLikeFeedTimelineRequest("/api/v1/feed/reels_tray/")).toBe(false);
+    expect(looksLikeFeedTimelineRequest("/api/v1/direct_v2/inbox/")).toBe(false);
+    expect(looksLikeFeedTimelineRequest("/graphql/query", "fb_api_req_friendly_name=PolarisStoriesV3SeenMutation")).toBe(false);
+  });
+
+  it("provides valid empty timeline payload with more_available: false", () => {
+    expect(EMPTY_TIMELINE_RESPONSE.more_available).toBe(false);
+    expect(EMPTY_TIMELINE_RESPONSE.feed_items).toHaveLength(0);
+    expect(EMPTY_TIMELINE_RESPONSE.data.xdt_api__v1__feed__timeline__connection.page_info.has_next_page).toBe(false);
   });
 });
 
@@ -365,3 +452,112 @@ describe("post media actions", () => {
     ]);
   });
 });
+
+describe("story media actions and caching", () => {
+  it("extracts and caches story video and image URLs into userStoryReels and storyItemMap", () => {
+    const payload = {
+      data: {
+        xdt_api__v1__feed__reels_media: {
+          reels_media: [
+            {
+              id: "123456",
+              user: { username: "minacantart" },
+              items: [
+                {
+                  id: "99887766",
+                  video_versions: [{ url: "https://cdninstagram.com/story-video-1.mp4", width: 1080, height: 1920 }],
+                  image_versions2: { candidates: [{ url: "https://cdninstagram.com/story-thumb-1.jpg", width: 1080, height: 1920 }] }
+                },
+                {
+                  id: "99887767",
+                  video_versions: [{ url: "https://cdninstagram.com/story-video-2.mp4", width: 1080, height: 1920 }],
+                  image_versions2: { candidates: [{ url: "https://cdninstagram.com/story-thumb-2.jpg", width: 1080, height: 1920 }] }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    };
+    extractStoryMediaFromJson(payload);
+    expect(storyItemMap.has("99887766")).toBe(true);
+    expect(storyItemMap.get("99887766")?.url).toBe("https://cdninstagram.com/story-video-1.mp4");
+    expect(userStoryReels.has("minacantart")).toBe(true);
+    expect(userStoryReels.get("minacantart")).toHaveLength(2);
+    expect(userStoryReels.get("minacantart")![1].url).toBe("https://cdninstagram.com/story-video-2.mp4");
+  });
+
+  it("extracts media URLs from React Fiber objects on DOM nodes", () => {
+    const video = document.createElement("video");
+    (video as any).__reactFiber$test = {
+      memoizedProps: {
+        video_versions: [{ url: "https://cdninstagram.com/fiber-video.mp4" }]
+      }
+    };
+    const extracted = extractMediaFromFiber(video);
+    expect(extracted?.videoUrl).toBe("https://cdninstagram.com/fiber-video.mp4");
+  });
+
+  it("handles Instagram XSSI prefix for (;;); when parsing JSON responses", () => {
+    const raw = `for (;;);{"data":{"xdt_api__v1__feed__reels_media":{"reels_media":[{"id":"555","user":{"username":"younesmohamed_77"},"items":[{"id":"777","video_versions":[{"url":"https://cdninstagram.com/younes-video.mp4"}]}]}]}}}`;
+    cleanAndParseJson(raw);
+    expect(userStoryReels.has("younesmohamed_77")).toBe(true);
+    expect(userStoryReels.get("younesmohamed_77")![0].url).toBe("https://cdninstagram.com/younes-video.mp4");
+  });
+
+  it("extracts exact number of story items for a user without sub-resolution or chunk pollution", () => {
+    const payload = {
+      data: {
+        xdt_api__v1__feed__reels_media: {
+          reels_media: [
+            {
+              id: "111",
+              user: { username: "ko_ghost17" },
+              items: [
+                {
+                  id: "story_1",
+                  pk: "1001",
+                  media_type: 2,
+                  video_versions: [
+                    { url: "https://cdninstagram.com/ko-1-1080p.mp4", width: 1080 },
+                    { url: "https://cdninstagram.com/ko-1-720p.mp4", width: 720 },
+                    { url: "https://cdninstagram.com/ko-1-480p.mp4", width: 480 }
+                  ],
+                  image_versions2: { candidates: [{ url: "https://cdninstagram.com/ko-1-thumb.jpg" }] }
+                },
+                {
+                  id: "story_2",
+                  pk: "1002",
+                  media_type: 1,
+                  image_versions2: {
+                    candidates: [
+                      { url: "https://cdninstagram.com/ko-2-full.jpg", width: 1080 },
+                      { url: "https://cdninstagram.com/ko-2-small.jpg", width: 360 }
+                    ]
+                  }
+                },
+                {
+                  id: "story_3",
+                  pk: "1003",
+                  media_type: 2,
+                  video_versions: [
+                    { url: "https://cdninstagram.com/ko-3-1080p.mp4", width: 1080 },
+                    { url: "https://cdninstagram.com/ko-3-720p.mp4", width: 720 }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    };
+    extractStoryMediaFromJson(payload);
+    expect(userStoryReels.get("ko_ghost17")).toHaveLength(3);
+    expect(userStoryReels.get("ko_ghost17")!.map((x) => x.url)).toEqual([
+      "https://cdninstagram.com/ko-1-1080p.mp4",
+      "https://cdninstagram.com/ko-2-full.jpg",
+      "https://cdninstagram.com/ko-3-1080p.mp4"
+    ]);
+  });
+});
+
