@@ -565,7 +565,12 @@ fn dispatch_notification<R: Runtime>(
     std::thread::spawn(move || {
         let _ = handle.wait_for_response(move |response: &notify_rust::NotificationResponse| {
             if !matches!(response, notify_rust::NotificationResponse::Closed(_)) {
-                show_instagram(&app, Some(&destination));
+                // wait_for_response fires on this background thread; showing the
+                // window and navigating the WebView2 view off the main thread
+                // crashes the app, so the work is marshalled back onto it.
+                let inner = app.clone();
+                let destination = destination.clone();
+                let _ = app.run_on_main_thread(move || show_instagram(&inner, Some(&destination)));
             }
         });
     });
