@@ -340,6 +340,18 @@ describe("inbox event classifier", () => {
     const [item] = parseInboxList(document);
     expect(item).toMatchObject({ event: "reaction", muted: false });
   });
+
+  it("detects a typing indicator from its accessibility label, not preview text", () => {
+    document.body.innerHTML = '<main><a href="/direct/t/7/"><span>Sarah</span><span>see you then · 2m</span><img src="/a.jpg"><div aria-label="Sarah is typing"></div></a></main>';
+    const [item] = parseInboxList(document);
+    expect(item).toMatchObject({ event: "typing", sender: "Sarah", preview: "is typing…" });
+  });
+
+  it("does not treat a message that mentions typing as the typing indicator", () => {
+    document.body.innerHTML = '<main><a href="/direct/t/8/"><span>Sarah</span><span>stop typing so loud</span><img src="/a.jpg"></a></main>';
+    const [item] = parseInboxList(document);
+    expect(item.event).toBe("message");
+  });
 });
 
 describe("navigation shortcuts", () => {

@@ -189,6 +189,20 @@ export function inboxEventKind(preview: string): InboxEvent {
   return "message";
 }
 
+/**
+ * Instagram renders a peer's typing state as an animated indicator with no
+ * message text, so the row's preview comes back empty or as the stale last
+ * message and the text classifier above never sees "typing". The indicator does
+ * carry a "typing" accessibility label, which is checked here so the state can
+ * be recognised straight off the row rather than from its (absent) preview text.
+ * The word is only trusted from aria labels, never from message text, so a
+ * message that happens to contain "typing" is not mistaken for the indicator.
+ */
+export function inboxRowTyping(row: Element): boolean {
+  if (/\btyping\b/i.test(row.getAttribute("aria-label") ?? "")) return true;
+  return Boolean(row.querySelector('[aria-label*="typing" i]'));
+}
+
 /** Instagram marks a muted conversation on the row itself rather than in the preview text. */
 export function inboxRowMuted(row: Element): boolean {
   if (row.querySelector('[aria-label*="muted" i], [aria-label*="notifications are off" i], svg[aria-label*="mute" i]')) return true;
@@ -367,8 +381,15 @@ export function parseInboxList(document: Document, origin = "https://www.instagr
   return inboxRowElements(document).flatMap((row) => {
     const conversationId = rowConversationId(row);
     if (!conversationId) return [];
-    const preview = inboxRowPreview(row);
-    if (!preview || isOwnLastMessage(row, preview)) return [];
+    const typing = inboxRowTyping(row);
+    let preview = inboxRowPreview(row);
+    // The typing indicator has no message text of its own, so stand in a preview
+    // for it when the row shows one — otherwise the empty/stale text below drops
+    // the row or misclassifies it as an ordinary message.
+    if (typing && inboxEventKind(preview) !== "typing") preview = "is typing…";
+    // A typing indicator is never the user's own message, so it bypasses the
+    // own-message guard that would otherwise discard a row previewing "You: …".
+    if (!preview || (!typing && isOwnLastMessage(row, preview))) return [];
     const threadId = rowThreadId(row);
     return [{
       conversationId,
@@ -377,7 +398,7 @@ export function parseInboxList(document: Document, origin = "https://www.instagr
       preview,
       messageKey: messageSignature(conversationId, preview),
       kind: inboxRowKind(row),
-      event: inboxEventKind(preview),
+      event: typing ? "typing" : inboxEventKind(preview),
       muted: inboxRowMuted(row),
       unread: inboxRowUnread(row)
     }];

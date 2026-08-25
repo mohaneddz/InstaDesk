@@ -188,6 +188,10 @@
     if (REACTION_RE.test(preview)) return "reaction";
     return "message";
   }
+  function inboxRowTyping(row) {
+    if (/\btyping\b/i.test(row.getAttribute("aria-label") ?? "")) return true;
+    return Boolean(row.querySelector('[aria-label*="typing" i]'));
+  }
   function inboxRowMuted(row) {
     if (row.querySelector('[aria-label*="muted" i], [aria-label*="notifications are off" i], svg[aria-label*="mute" i]')) return true;
     return /muted/i.test(row.getAttribute("aria-label") ?? "");
@@ -281,8 +285,10 @@
     return inboxRowElements(document2).flatMap((row) => {
       const conversationId = rowConversationId(row);
       if (!conversationId) return [];
-      const preview = inboxRowPreview(row);
-      if (!preview || isOwnLastMessage(row, preview)) return [];
+      const typing = inboxRowTyping(row);
+      let preview = inboxRowPreview(row);
+      if (typing && inboxEventKind(preview) !== "typing") preview = "is typing\u2026";
+      if (!preview || !typing && isOwnLastMessage(row, preview)) return [];
       const threadId = rowThreadId(row);
       return [{
         conversationId,
@@ -291,7 +297,7 @@
         preview,
         messageKey: messageSignature(conversationId, preview),
         kind: inboxRowKind(row),
-        event: inboxEventKind(preview),
+        event: typing ? "typing" : inboxEventKind(preview),
         muted: inboxRowMuted(row),
         unread: inboxRowUnread(row)
       }];
