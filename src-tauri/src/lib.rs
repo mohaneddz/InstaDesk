@@ -14,7 +14,6 @@ use tauri::{
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
-use tauri_plugin_notification::NotificationExt;
 
 const INSTAGRAM_HOME: &str = "https://www.instagram.com/";
 const INSTAGRAM_INBOX: &str = "https://www.instagram.com/direct/inbox/";
@@ -156,6 +155,18 @@ struct AppState {
     /// Uses an AtomicBool rather than a Mutex<bool> for lock-free reads in the
     /// CloseRequested handler.
     quitting: AtomicBool,
+    /// Whether the main window is currently shown to the user. Tracked
+    /// explicitly at every show/hide site rather than read back from
+    /// `is_visible()`, which does not reliably report a window hidden to the
+    /// tray and made "don't notify while open" suppress notifications even when
+    /// the app was closed.
+    window_shown: AtomicBool,
+}
+
+fn set_window_shown<R: Runtime>(app: &AppHandle<R>, shown: bool) {
+    app.state::<AppState>()
+        .window_shown
+        .store(shown, Ordering::SeqCst);
 }
 
 fn settings_path<R: Runtime>(app: &AppHandle<R>) -> Option<std::path::PathBuf> {
@@ -204,12 +215,14 @@ fn show_instagram<R: Runtime>(app: &AppHandle<R>, destination: Option<&str>) {
     let _ = window.show();
     let _ = window.unminimize();
     let _ = window.set_focus();
+    set_window_shown(app, true);
 }
 
 fn hide_main_window<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
     if let Some(settings) = app.get_webview_window("settings") {
         let _ = settings.hide();
     }
+    set_window_shown(app, false);
     leave_open_thread(app);
     let minimize_to_tray = app
         .state::<AppState>()
@@ -285,6 +298,7 @@ fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        set_window_shown(app, true);
     }
 }
 
@@ -351,12 +365,15 @@ fn layout_main_window<R: Runtime>(window: &Window<R>) {
             chrome_height.min(size.height),
         ));
     }
-    if let Some(instagram) = window.app_handle().get_webview("instagram") {
-        let _ = instagram.set_position(PhysicalPosition::new(0, chrome_height as i32));
-        let _ = instagram.set_size(PhysicalSize::new(
-            size.width,
-            size.height.saturating_sub(chrome_height),
-        ));
+    let content_height = size.height.saturating_sub(chrome_height);
+    // Keep the hidden inbox monitor sized to the content area too, so it stays
+    // fully covered by the Instagram view and keeps rendering its conversation
+    // list at real dimensions.
+    for label in ["inbox", "instagram"] {
+        if let Some(webview) = window.app_handle().get_webview(label) {
+            let _ = webview.set_position(PhysicalPosition::new(0, chrome_height as i32));
+            let _ = webview.set_size(PhysicalSize::new(size.width, content_height));
+        }
     }
 }
 
@@ -389,11 +406,28 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
         .build()?;
     let size = window.inner_size()?;
     let chrome_height = (TITLEBAR_HEIGHT * window.scale_factor().unwrap_or(1.0)).round() as u32;
+    let content_height = size.height.saturating_sub(chrome_height);
     window.add_child(
         WebviewBuilder::new("main", WebviewUrl::App("index.html".into()))
             .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS),
         PhysicalPosition::new(0, 0),
         PhysicalSize::new(size.width, chrome_height),
+    )?;
+    // The inbox monitor's WebView is added before — and so painted beneath — the
+    // visible Instagram WebView, sharing the same content-area bounds. It has to
+    // occupy real on-screen space: Instagram's conversation list is a virtualised
+    // list driven by IntersectionObserver, which reports nothing while the WebView
+    // is parked off-screen and unpainted, so the list stays empty and no message
+    // is ever detected. Sitting full-size behind the visible view, it renders and
+    // stays populated while the foreground view covers it completely.
+    let inbox_url = url::Url::parse(INSTAGRAM_INBOX).expect("valid Instagram URL");
+    window.add_child(
+        WebviewBuilder::new("inbox", WebviewUrl::External(inbox_url))
+            .initialization_script(inbox_init)
+            .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS)
+            .on_navigation(|url| instagram_url(url.as_str()).is_some()),
+        PhysicalPosition::new(0, chrome_height as i32),
+        PhysicalSize::new(size.width, content_height),
     )?;
     window.add_child(
         WebviewBuilder::new("instagram", WebviewUrl::External(url))
@@ -401,18 +435,7 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
             .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS)
             .on_navigation(|url| instagram_url(url.as_str()).is_some()),
         PhysicalPosition::new(0, chrome_height as i32),
-        PhysicalSize::new(size.width, size.height.saturating_sub(chrome_height)),
-    )?;
-    // Runs off-screen at all times so new messages are caught regardless of
-    // which page is visible, or whether the window is minimized or hidden.
-    let inbox_url = url::Url::parse(INSTAGRAM_INBOX).expect("valid Instagram URL");
-    window.add_child(
-        WebviewBuilder::new("inbox", WebviewUrl::External(inbox_url))
-            .initialization_script(inbox_init)
-            .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS)
-            .on_navigation(|url| instagram_url(url.as_str()).is_some()),
-        PhysicalPosition::new(-20_000, -20_000),
-        PhysicalSize::new(1280, 800),
+        PhysicalSize::new(size.width, content_height),
     )?;
     let handle = app.clone();
     window.on_window_event(move |event| match event {
@@ -432,6 +455,7 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
                 .unwrap_or(true);
             if minimize && !quitting {
                 api.prevent_close();
+                set_window_shown(&handle, false);
                 leave_open_thread(&handle);
                 if let Some(window) = handle.get_window("main") {
                     let _ = window.hide();
@@ -496,18 +520,25 @@ fn is_new_message(state: &AppState, key: String) -> bool {
     true
 }
 
+/// Calls notify-rust directly rather than going through tauri-plugin-notification's
+/// `NotificationBuilder`, for two reasons the wrapper doesn't leave room for:
+///
+/// - The wrapper only sets notify-rust's `app_id` when running from an installed
+///   location, not a `target/debug` or `target/release` build. Without it,
+///   notify-rust falls back to its hardcoded PowerShell app id, so every dev-mode
+///   toast is shown (and would activate) as Windows PowerShell rather than
+///   InstaDesk. Setting it ourselves, unconditionally, ties every toast to the
+///   AUMID this app actually registers a shortcut for.
+/// - The wrapper discards the `NotificationHandle` returned by `show()`, which is
+///   the only way to learn a toast was clicked. Keeping it lets a click bring the
+///   window forward instead of the notification being a dead end.
 fn dispatch_notification<R: Runtime>(
     app: &AppHandle<R>,
     sender: &str,
     preview: &str,
-    _destination: &str,
+    destination: &str,
     kind: &str,
 ) -> Result<(), String> {
-    if let Ok(state) = app.notification().permission_state() {
-        if !matches!(state, tauri_plugin_notification::PermissionState::Granted) {
-            let _ = app.notification().request_permission();
-        }
-    }
     let title = if kind == "group" {
         format!("{sender} (Group)")
     } else {
@@ -518,28 +549,28 @@ fn dispatch_notification<R: Runtime>(
     } else {
         preview.trim()
     };
-    let mut builder = app.notification().builder();
-    builder = builder.title(title).body(body);
 
-    let resolved_icon = if let Ok(abs) = std::fs::canonicalize("icons/128x128.png") {
-        Some(abs.to_string_lossy().trim_start_matches(r"\\?\").to_string())
-    } else if let Ok(res_dir) = app.path().resource_dir() {
-        let p = res_dir.join("icons/128x128.png");
-        if p.exists() {
-            Some(p.to_string_lossy().to_string())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // No hero image: the small app logo in the corner already comes from the
+    // AUMID shortcut, so attaching an inline image only added a large redundant
+    // Instagram icon filling the middle of the toast.
+    let mut notification = notify_rust::Notification::new();
+    notification.summary(&title).body(body);
+    #[cfg(windows)]
+    notification.app_id("com.instadesk.desktop");
 
-    if let Some(icon) = resolved_icon {
-        builder = builder.icon(icon);
-    }
+    let handle = notification.show().map_err(|error| error.to_string())?;
 
-    let result = builder.show().map_err(|e| e.to_string());
-    result
+    let app = app.clone();
+    let destination = destination.to_string();
+    std::thread::spawn(move || {
+        let _ = handle.wait_for_response(move |response: &notify_rust::NotificationResponse| {
+            if !matches!(response, notify_rust::NotificationResponse::Closed(_)) {
+                show_instagram(&app, Some(&destination));
+            }
+        });
+    });
+
+    Ok(())
 }
 
 /// Each kind of inbox event carries its own toggle, so a reaction or a typing
@@ -634,20 +665,25 @@ fn incoming_message(app: AppHandle, webview: Webview, message: InboxMessage) -> 
     if !sender_allowed(&settings, &message.sender) {
         return Ok(());
     }
+    // Checked before dedup so a message suppressed while the app is open does not
+    // burn its dedup slot — otherwise the same message could never notify later.
+    // The window counts as "open" only when it is both shown (tracked flag, since
+    // is_visible misreports a tray-hidden window) and not minimized to the taskbar.
+    if !settings.show_notifications_when_open {
+        let shown = state.window_shown.load(Ordering::SeqCst);
+        let minimized = app
+            .get_window("main")
+            .and_then(|w| w.is_minimized().ok())
+            .unwrap_or(false);
+        if shown && !minimized {
+            eprintln!("[InstaDesk] notification suppressed because app window is open");
+            return Ok(());
+        }
+    }
     let key = format!("{}:{}", message.conversation_id, message.message_key);
     if !is_new_message(&state, key) {
         eprintln!("[InstaDesk] duplicate ignored");
         return Ok(());
-    }
-    if !settings.show_notifications_when_open {
-        if let Some(main_win) = app.get_window("main") {
-            let visible = main_win.is_visible().unwrap_or(false);
-            let minimized = main_win.is_minimized().unwrap_or(false);
-            if visible && !minimized {
-                eprintln!("[InstaDesk] notification suppressed because app window is open and visible");
-                return Ok(());
-            }
-        }
     }
     let body = if settings.notification_previews {
         message.preview
@@ -996,6 +1032,7 @@ fn window_action(app: AppHandle, webview: Webview, action: &str) -> Result<(), S
                 .map(|s| s.minimize_to_tray)
                 .unwrap_or(true);
             if minimize {
+                set_window_shown(&app, false);
                 leave_open_thread(&app);
                 window.hide()
             } else {
@@ -1206,15 +1243,25 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> tauri::Res
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_notification::init())
+        // Must be the first plugin: a second launch (double click, or a manual
+        // start on top of the autostart copy) would otherwise bring up a rival
+        // set of windows and background webviews sharing one WebView2 data
+        // directory — which surfaced as duplicate instances and a titlebar that
+        // rendered as a blank grey pane. Instead, hand the running instance
+        // focus and let the newcomer exit.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_instagram(app, None);
+        }))
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--hidden"])))
         .invoke_handler(tauri::generate_handler![incoming_message, report_diagnostic, get_settings, update_settings, get_content_controls, window_action, settings_ui_ready, download_media, copy_image])
         .setup(|app| {
             let settings = load_settings(app.handle());
+            let launched_hidden = std::env::args().any(|arg| arg == "--hidden");
             app.manage(AppState {
                 settings: Mutex::new(settings.clone()),
                 dedup: Mutex::new((HashSet::new(), VecDeque::new())),
                 quitting: AtomicBool::new(false),
+                window_shown: AtomicBool::new(!launched_hidden),
             });
             build_tray(app.handle(), &settings)?;
             create_settings_window(app.handle())?;
@@ -1229,7 +1276,7 @@ pub fn run() {
                 ensure_windows_shortcut_registered();
             }
             install_toggle_shortcut(app.handle());
-            if std::env::args().any(|arg| arg == "--hidden") { let _ = window.hide(); }
+            if launched_hidden { let _ = window.hide(); }
             if std::env::args().any(|arg| arg == "--open-settings") { show_settings(app.handle()); }
             #[cfg(debug_assertions)]
             if std::env::args().any(|arg| arg == "--ipc-self-test") {
