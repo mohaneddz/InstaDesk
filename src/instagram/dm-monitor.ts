@@ -195,18 +195,24 @@ export function inboxEventKind(preview: string): InboxEvent {
   return "message";
 }
 
+const TYPING_LEAF_RE = /^\s*typing\s*(?:…|\.{1,3})?\s*$/i;
+
 /**
- * Instagram renders a peer's typing state as an animated indicator with no
- * message text, so the row's preview comes back empty or as the stale last
- * message and the text classifier above never sees "typing". The indicator does
- * carry a "typing" accessibility label, which is checked here so the state can
- * be recognised straight off the row rather than from its (absent) preview text.
- * The word is only trusted from aria labels, never from message text, so a
- * message that happens to contain "typing" is not mistaken for the indicator.
+ * Instagram renders a peer's typing state as an animated indicator whose "…" is
+ * separate, textless dot elements, so the row's joined preview can bury it or
+ * come back as the stale last message and the text classifier above misses it.
+ * Three independent signals are checked so the state is caught however a given
+ * build marks it up: a "typing" accessibility label on the row or a descendant,
+ * and — the reliable one for the animated-dots markup — a leaf element whose
+ * entire text is "Typing"/"Typing…". Matching only a whole-leaf "typing" (never
+ * a substring) keeps a message that merely contains the word from being mistaken
+ * for the indicator.
  */
 export function inboxRowTyping(row: Element): boolean {
   if (/\btyping\b/i.test(row.getAttribute("aria-label") ?? "")) return true;
-  return Boolean(row.querySelector('[aria-label*="typing" i]'));
+  if (row.querySelector('[aria-label*="typing" i]')) return true;
+  return [...row.querySelectorAll("span, div")]
+    .some((element) => element.children.length === 0 && TYPING_LEAF_RE.test(element.textContent ?? ""));
 }
 
 /** Instagram marks a muted conversation on the row itself rather than in the preview text. */
@@ -1853,11 +1859,21 @@ export function installInboxMonitor(win: Window): void {
   const seen = new Map<string, string>();
   const wasUnread = new Map<string, boolean>();
   const lastNotifiedAt = new Map<string, number>();
+  // Typing is a transient state, tracked apart from the message-diff maps: its
+  // rising edge is what fires, and it deliberately never touches `seen`, so the
+  // row reverting to its previous message when typing stops does not read as a
+  // new message and re-announce something already seen.
+  const typingActive = new Map<string, boolean>();
+  const lastTypingAt = new Map<string, number>();
   // Safety net beneath the time-invariant message key: even if some other
   // volatile fragment slips into a row's preview, a single conversation can
   // never fire more than once per this window, so a detection glitch degrades
   // to one stray notification rather than a storm.
   const NOTIFY_COOLDOWN_MS = 4000;
+  // Typing flaps on and off as the peer pauses; a longer window keeps one burst
+  // of typing to a single notification without swallowing a later real message,
+  // which is gated separately by NOTIFY_COOLDOWN_MS.
+  const TYPING_COOLDOWN_MS = 12000;
   let primed = false;
   let timer: number | undefined;
   let emptyScans = 0;
@@ -1897,6 +1913,10 @@ export function installInboxMonitor(win: Window): void {
       if (!primed) {
         if (candidates.length > 0) {
           for (const item of candidates) {
+            // A row that happens to be typing at launch carries no real message
+            // key, so it is not used as the baseline; the next scan without the
+            // indicator establishes it.
+            if (item.event === "typing") continue;
             seen.set(item.conversationId, item.messageKey);
             wasUnread.set(item.conversationId, item.unread);
           }
@@ -1906,7 +1926,23 @@ export function installInboxMonitor(win: Window): void {
         return;
       }
       const now = Date.now();
+      const dispatch = (item: InboxCandidate) => {
+        report("incoming message detected", `${item.kind} ${item.event}${item.muted ? " (muted)" : ""} from ${item.sender} via ${inboxRowSource(win.document)} on ${win.location.pathname}`);
+        void win.__TAURI_INTERNALS__?.invoke("incoming_message", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
+      };
       for (const item of candidates) {
+        if (item.event === "typing") {
+          // Fire on the rising edge only, on its own cooldown, and leave the
+          // message-diff state untouched so the stop transition stays silent.
+          const wasTyping = typingActive.get(item.conversationId) ?? false;
+          typingActive.set(item.conversationId, true);
+          const lastAt = lastTypingAt.get(item.conversationId) ?? 0;
+          if (wasTyping || now - lastAt < TYPING_COOLDOWN_MS) continue;
+          lastTypingAt.set(item.conversationId, now);
+          dispatch(item);
+          continue;
+        }
+        typingActive.set(item.conversationId, false);
         // A new message shows up as either the last-message text changing or the
         // row flipping from read to unread; the latter also catches an identical
         // message sent again after the previous one was read.
@@ -1918,8 +1954,7 @@ export function installInboxMonitor(win: Window): void {
         const lastAt = lastNotifiedAt.get(item.conversationId) ?? 0;
         if (now - lastAt < NOTIFY_COOLDOWN_MS) continue;
         lastNotifiedAt.set(item.conversationId, now);
-        report("incoming message detected", `${item.kind} ${item.event}${item.muted ? " (muted)" : ""} from ${item.sender} via ${inboxRowSource(win.document)} on ${win.location.pathname}`);
-        void win.__TAURI_INTERNALS__?.invoke("incoming_message", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
+        dispatch(item);
       }
     } catch (error) { console.warn("[InstaDesk] inbox parsing failure", error); }
   };

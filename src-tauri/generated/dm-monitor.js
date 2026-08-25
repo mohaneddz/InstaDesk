@@ -188,9 +188,11 @@
     if (REACTION_RE.test(preview)) return "reaction";
     return "message";
   }
+  var TYPING_LEAF_RE = /^\s*typing\s*(?:…|\.{1,3})?\s*$/i;
   function inboxRowTyping(row) {
     if (/\btyping\b/i.test(row.getAttribute("aria-label") ?? "")) return true;
-    return Boolean(row.querySelector('[aria-label*="typing" i]'));
+    if (row.querySelector('[aria-label*="typing" i]')) return true;
+    return [...row.querySelectorAll("span, div")].some((element) => element.children.length === 0 && TYPING_LEAF_RE.test(element.textContent ?? ""));
   }
   function inboxRowMuted(row) {
     if (row.querySelector('[aria-label*="muted" i], [aria-label*="notifications are off" i], svg[aria-label*="mute" i]')) return true;
@@ -1507,7 +1509,10 @@
     const seen = /* @__PURE__ */ new Map();
     const wasUnread = /* @__PURE__ */ new Map();
     const lastNotifiedAt = /* @__PURE__ */ new Map();
+    const typingActive = /* @__PURE__ */ new Map();
+    const lastTypingAt = /* @__PURE__ */ new Map();
     const NOTIFY_COOLDOWN_MS = 4e3;
+    const TYPING_COOLDOWN_MS = 12e3;
     let primed = false;
     let timer;
     let emptyScans = 0;
@@ -1543,6 +1548,7 @@
         if (!primed) {
           if (candidates.length > 0) {
             for (const item of candidates) {
+              if (item.event === "typing") continue;
               seen.set(item.conversationId, item.messageKey);
               wasUnread.set(item.conversationId, item.unread);
             }
@@ -1552,7 +1558,21 @@
           return;
         }
         const now = Date.now();
+        const dispatch = (item) => {
+          report("incoming message detected", `${item.kind} ${item.event}${item.muted ? " (muted)" : ""} from ${item.sender} via ${inboxRowSource(win.document)} on ${win.location.pathname}`);
+          void win.__TAURI_INTERNALS__?.invoke("incoming_message", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
+        };
         for (const item of candidates) {
+          if (item.event === "typing") {
+            const wasTyping = typingActive.get(item.conversationId) ?? false;
+            typingActive.set(item.conversationId, true);
+            const lastAt2 = lastTypingAt.get(item.conversationId) ?? 0;
+            if (wasTyping || now - lastAt2 < TYPING_COOLDOWN_MS) continue;
+            lastTypingAt.set(item.conversationId, now);
+            dispatch(item);
+            continue;
+          }
+          typingActive.set(item.conversationId, false);
           const textChanged = seen.get(item.conversationId) !== item.messageKey;
           const becameUnread = item.unread && !(wasUnread.get(item.conversationId) ?? false);
           seen.set(item.conversationId, item.messageKey);
@@ -1561,8 +1581,7 @@
           const lastAt = lastNotifiedAt.get(item.conversationId) ?? 0;
           if (now - lastAt < NOTIFY_COOLDOWN_MS) continue;
           lastNotifiedAt.set(item.conversationId, now);
-          report("incoming message detected", `${item.kind} ${item.event}${item.muted ? " (muted)" : ""} from ${item.sender} via ${inboxRowSource(win.document)} on ${win.location.pathname}`);
-          void win.__TAURI_INTERNALS__?.invoke("incoming_message", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
+          dispatch(item);
         }
       } catch (error) {
         console.warn("[InstaDesk] inbox parsing failure", error);
