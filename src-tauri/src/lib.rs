@@ -288,6 +288,14 @@ fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// Toast notifications resolve their icon and display name through this
+/// shortcut's AppUserModelID property, matched against the target path.
+/// Skipping the rewrite whenever a shortcut already existed meant a stale
+/// target (e.g. left over from early prototyping, pointing at powershell.exe
+/// instead of the app) was never corrected — notifications then either
+/// showed under the wrong identity or failed to display at all. Rewriting it
+/// unconditionally on every launch is cheap (a hidden background process)
+/// and keeps it pinned to whichever executable is actually running.
 #[cfg(windows)]
 fn ensure_windows_shortcut_registered() {
     let appdata = std::env::var("APPDATA").unwrap_or_default();
@@ -296,9 +304,6 @@ fn ensure_windows_shortcut_registered() {
     }
     let shortcut_path = std::path::PathBuf::from(&appdata)
         .join(r"Microsoft\Windows\Start Menu\Programs\InstaDesk.lnk");
-    if shortcut_path.exists() {
-        return;
-    }
     let Ok(current_exe) = std::env::current_exe() else {
         return;
     };
