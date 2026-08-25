@@ -21,6 +21,12 @@ const INSTAGRAM_INBOX: &str = "https://www.instagram.com/direct/inbox/";
 const SETTINGS_FILE: &str = "settings.json";
 const MAX_DEDUP: usize = 1000;
 const TITLEBAR_HEIGHT: f64 = 38.0;
+/// Without this, WebView2 applies Chromium's normal background-tab throttling
+/// once the host window has been hidden for a while, which starves the inbox
+/// webview's polling timers and silently stops new-message detection. The
+/// `--disable-features=...` prefix has to be repeated here because setting
+/// additional browser args replaces wry's own default rather than appending.
+const KEEP_RUNNING_IN_BACKGROUND_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding";
 
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -198,6 +204,7 @@ fn hide_main_window<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
     if let Some(settings) = app.get_webview_window("settings") {
         let _ = settings.hide();
     }
+    leave_open_thread(app);
     let minimize_to_tray = app
         .state::<AppState>()
         .settings
@@ -208,6 +215,22 @@ fn hide_main_window<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
         let _ = window.hide();
     } else {
         let _ = window.minimize();
+    }
+}
+
+/// A thread left open behind a hidden window keeps receiving live messages
+/// over Instagram's own socket, and Instagram marks those seen on arrival
+/// regardless of whether the OS window is visible. Navigating back to the
+/// inbox list before hiding means nothing stays "open" to auto-mark seen.
+fn leave_open_thread<R: Runtime>(app: &AppHandle<R>) {
+    let Some(instagram) = app.get_webview("instagram") else {
+        return;
+    };
+    let Ok(url) = instagram.url() else {
+        return;
+    };
+    if url.path().starts_with("/direct/t/") {
+        navigate(&instagram, INSTAGRAM_INBOX);
     }
 }
 
@@ -363,6 +386,7 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
     window.add_child(
         WebviewBuilder::new("instagram", WebviewUrl::External(url))
             .initialization_script(instagram_init)
+            .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS)
             .on_navigation(|url| instagram_url(url.as_str()).is_some()),
         PhysicalPosition::new(0, chrome_height as i32),
         PhysicalSize::new(size.width, size.height.saturating_sub(chrome_height)),
@@ -373,6 +397,7 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
     window.add_child(
         WebviewBuilder::new("inbox", WebviewUrl::External(inbox_url))
             .initialization_script(inbox_init)
+            .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS)
             .on_navigation(|url| instagram_url(url.as_str()).is_some()),
         PhysicalPosition::new(-20_000, -20_000),
         PhysicalSize::new(1280, 800),
@@ -395,6 +420,7 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
                 .unwrap_or(true);
             if minimize && !quitting {
                 api.prevent_close();
+                leave_open_thread(&handle);
                 if let Some(window) = handle.get_window("main") {
                     let _ = window.hide();
                 }
@@ -957,6 +983,7 @@ fn window_action(app: AppHandle, webview: Webview, action: &str) -> Result<(), S
                 .map(|s| s.minimize_to_tray)
                 .unwrap_or(true);
             if minimize {
+                leave_open_thread(&app);
                 window.hide()
             } else {
                 window.close()
