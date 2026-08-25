@@ -110,6 +110,12 @@
     }
     return (hash >>> 0).toString(36);
   }
+  var TIME_TOKEN = /\b\d+\s*(?:s|m|h|d|w|sec|min|mins|minute|hour|hr|day|week)s?(?:\s+ago)?\b|\b(?:now|just now|yesterday|active)\b/gi;
+  var UNREAD_TOKEN = /\d+\+?\s*new messages?|\bunread\b/gi;
+  function messageSignature(conversationId, preview) {
+    const normalized = preview.toLowerCase().replace(UNREAD_TOKEN, "").replace(TIME_TOKEN, "").replace(/[·•.,:]/g, " ").replace(/\s+/g, " ").trim();
+    return stableHash(`${conversationId}|${normalized}`);
+  }
   function threadIdFromPath(pathname) {
     return pathname.match(THREAD_RE)?.[1] ?? null;
   }
@@ -186,6 +192,13 @@
     if (row.querySelector('[aria-label*="muted" i], [aria-label*="notifications are off" i], svg[aria-label*="mute" i]')) return true;
     return /muted/i.test(row.getAttribute("aria-label") ?? "");
   }
+  function inboxRowUnread(row) {
+    const aria = row.getAttribute("aria-label") ?? "";
+    if (/\bunread\b/i.test(aria)) return true;
+    if (row.querySelector('[aria-label*="unread" i]')) return true;
+    const text = normalizedText(row);
+    return /\bunread\b/i.test(text) || /\d+\+?\s*new messages?/i.test(text);
+  }
   function inboxRowTitle(row) {
     const directSpans = [...row.querySelectorAll("span, div, h2, h3, h4")].filter((el) => el.children.length === 0).map((el) => normalizedText(el)).filter((txt) => txt.length > 0 && !TIME_ONLY.test(txt) && txt !== "\xB7");
     if (directSpans.length > 0) {
@@ -217,6 +230,7 @@
     }
     preview = preview.replace(/^[\s·:,-]+/, "").trim();
     preview = preview.replace(TIMESTAMP_SUFFIX, "").trim();
+    preview = preview.replace(/\s*\bunread\b\s*$/i, "").trim();
     return preview.slice(0, 240);
   }
   function inboxRowKind(row) {
@@ -275,10 +289,11 @@
         conversationUrl: new URL(threadId ? `/direct/t/${threadId}/` : "/direct/inbox/", origin).href,
         sender: inboxRowTitle(row),
         preview,
-        messageKey: stableHash(`${conversationId}|${preview}`),
+        messageKey: messageSignature(conversationId, preview),
         kind: inboxRowKind(row),
         event: inboxEventKind(preview),
-        muted: inboxRowMuted(row)
+        muted: inboxRowMuted(row),
+        unread: inboxRowUnread(row)
       }];
     });
   }
@@ -968,8 +983,9 @@
         return nativeSendBeacon(url, data);
       };
     }
-    if (typeof win.CanvasGradient !== "undefined") {
-      const gradProto = win.CanvasGradient.prototype;
+    const winGlobals = win;
+    if (typeof winGlobals.CanvasGradient !== "undefined") {
+      const gradProto = winGlobals.CanvasGradient.prototype;
       const nativeAddColorStop = gradProto.addColorStop;
       gradProto.addColorStop = function(offset, color) {
         if (enabledGhost()) {
@@ -981,8 +997,8 @@
         return nativeAddColorStop.call(this, offset, color);
       };
     }
-    if (typeof win.CanvasRenderingContext2D !== "undefined") {
-      const ctxProto = win.CanvasRenderingContext2D.prototype;
+    if (typeof winGlobals.CanvasRenderingContext2D !== "undefined") {
+      const ctxProto = winGlobals.CanvasRenderingContext2D.prototype;
       const strokeDesc = Object.getOwnPropertyDescriptor(ctxProto, "strokeStyle") || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(ctxProto), "strokeStyle");
       if (strokeDesc?.set) {
         const nativeStrokeSet = strokeDesc.set;
@@ -1456,10 +1472,36 @@
     win.addEventListener("popstate", enhance);
     enhance();
   }
+  function forcePageVisible(win) {
+    const doc = win.document;
+    try {
+      for (const [prop, value] of [
+        ["hidden", false],
+        ["webkitHidden", false],
+        ["visibilityState", "visible"],
+        ["webkitVisibilityState", "visible"]
+      ]) {
+        Object.defineProperty(doc, prop, { configurable: true, get: () => value });
+      }
+      doc.hasFocus = () => true;
+      const swallow = (event) => {
+        event.stopImmediatePropagation();
+      };
+      for (const type of ["visibilitychange", "webkitvisibilitychange", "blur", "freeze"]) {
+        win.addEventListener(type, swallow, true);
+        doc.addEventListener(type, swallow, true);
+      }
+    } catch (error) {
+      console.warn("[InstaDesk] could not pin page visibility", error);
+    }
+  }
   function installInboxMonitor(win) {
     if (win.__INSTADESK_INBOX_MONITOR__) return;
     win.__INSTADESK_INBOX_MONITOR__ = true;
     const seen = /* @__PURE__ */ new Map();
+    const wasUnread = /* @__PURE__ */ new Map();
+    const lastNotifiedAt = /* @__PURE__ */ new Map();
+    const NOTIFY_COOLDOWN_MS = 4e3;
     let primed = false;
     let timer;
     let emptyScans = 0;
@@ -1494,15 +1536,25 @@
         if (candidates.length) emptyScans = 0;
         if (!primed) {
           if (candidates.length > 0) {
-            for (const item of candidates) seen.set(item.conversationId, item.messageKey);
+            for (const item of candidates) {
+              seen.set(item.conversationId, item.messageKey);
+              wasUnread.set(item.conversationId, item.unread);
+            }
             primed = true;
             report("inbox monitor primed", `${seen.size} conversations`);
           }
           return;
         }
+        const now = Date.now();
         for (const item of candidates) {
-          if (seen.get(item.conversationId) === item.messageKey) continue;
+          const textChanged = seen.get(item.conversationId) !== item.messageKey;
+          const becameUnread = item.unread && !(wasUnread.get(item.conversationId) ?? false);
           seen.set(item.conversationId, item.messageKey);
+          wasUnread.set(item.conversationId, item.unread);
+          if (!textChanged && !becameUnread) continue;
+          const lastAt = lastNotifiedAt.get(item.conversationId) ?? 0;
+          if (now - lastAt < NOTIFY_COOLDOWN_MS) continue;
+          lastNotifiedAt.set(item.conversationId, now);
           report("incoming message detected", `${item.kind} ${item.event}${item.muted ? " (muted)" : ""} from ${item.sender} via ${inboxRowSource(win.document)} on ${win.location.pathname}`);
           void win.__TAURI_INTERNALS__?.invoke("incoming_message", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
         }
@@ -1522,6 +1574,7 @@
     installRemoteIpcFallback(window);
     installGhostStories(window);
     if (window.__INSTADESK_ROLE__ === "inbox") {
+      forcePageVisible(window);
       const start = () => installInboxMonitor(window);
       if (document.body) start();
       else document.addEventListener("DOMContentLoaded", start, { once: true });

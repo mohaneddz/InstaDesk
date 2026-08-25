@@ -52,6 +52,28 @@ function stableHash(value: string): string {
   return (hash >>> 0).toString(36);
 }
 
+// Instagram keeps repainting a conversation row's relative timestamp as it ages
+// ("2m" → "3m" → …), and any such drift embedded in the preview would change the
+// dedup key on every scan and re-fire the same message as if it were new — the
+// notification storm. The signature strips every time token (and the separators
+// around them) so the key only changes when the actual message text does.
+const TIME_TOKEN = /\b\d+\s*(?:s|m|h|d|w|sec|min|mins|minute|hour|hr|day|week)s?(?:\s+ago)?\b|\b(?:now|just now|yesterday|active)\b/gi;
+// Instagram collapses a backlog into a running "N new messages" / "N+ new
+// messages" summary and tags rows "Unread"; both climb and toggle on every scan
+// without the actual message changing. Folding them out keeps the dedup key
+// stable so the same backlog is not re-announced over and over.
+const UNREAD_TOKEN = /\d+\+?\s*new messages?|\bunread\b/gi;
+export function messageSignature(conversationId: string, preview: string): string {
+  const normalized = preview
+    .toLowerCase()
+    .replace(UNREAD_TOKEN, "")
+    .replace(TIME_TOKEN, "")
+    .replace(/[·•.,:]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return stableHash(`${conversationId}|${normalized}`);
+}
+
 export function threadIdFromPath(pathname: string): string | null {
   return pathname.match(THREAD_RE)?.[1] ?? null;
 }
@@ -150,6 +172,7 @@ export interface InboxCandidate {
   kind: "private" | "group" | "unknown";
   event: InboxEvent;
   muted: boolean;
+  unread: boolean;
 }
 
 const REACTION_RE = /(?:liked your message|reacted (?:\S+ )?to your message|reacted to (?:your|a) message)/i;
@@ -170,6 +193,21 @@ export function inboxEventKind(preview: string): InboxEvent {
 export function inboxRowMuted(row: Element): boolean {
   if (row.querySelector('[aria-label*="muted" i], [aria-label*="notifications are off" i], svg[aria-label*="mute" i]')) return true;
   return /muted/i.test(row.getAttribute("aria-label") ?? "");
+}
+
+/**
+ * Whether the row currently carries an unread marker. Instagram signals this
+ * with an "Unread" badge, an unread aria-label, or a running "N new messages"
+ * summary. Used as a second detection trigger so a conversation going from read
+ * to unread fires even when the message text is identical to the previous one —
+ * the case a pure text diff misses (e.g. the same word sent twice).
+ */
+export function inboxRowUnread(row: Element): boolean {
+  const aria = row.getAttribute("aria-label") ?? "";
+  if (/\bunread\b/i.test(aria)) return true;
+  if (row.querySelector('[aria-label*="unread" i]')) return true;
+  const text = normalizedText(row);
+  return /\bunread\b/i.test(text) || /\d+\+?\s*new messages?/i.test(text);
 }
 
 /** Extracts the clean conversation/sender name from an inbox row element. */
@@ -220,6 +258,10 @@ export function inboxRowPreview(row: Element): string {
 
   preview = preview.replace(/^[\s·:,-]+/, "").trim();
   preview = preview.replace(TIMESTAMP_SUFFIX, "").trim();
+  // Instagram appends its unread badge text ("… Unread") to the row, which is
+  // not part of the message and toggles as the conversation is read, so it is
+  // stripped from what the notification shows.
+  preview = preview.replace(/\s*\bunread\b\s*$/i, "").trim();
   return preview.slice(0, 240);
 }
 
@@ -333,10 +375,11 @@ export function parseInboxList(document: Document, origin = "https://www.instagr
       conversationUrl: new URL(threadId ? `/direct/t/${threadId}/` : "/direct/inbox/", origin).href,
       sender: inboxRowTitle(row),
       preview,
-      messageKey: stableHash(`${conversationId}|${preview}`),
+      messageKey: messageSignature(conversationId, preview),
       kind: inboxRowKind(row),
       event: inboxEventKind(preview),
-      muted: inboxRowMuted(row)
+      muted: inboxRowMuted(row),
+      unread: inboxRowUnread(row)
     }];
   });
 }
@@ -1738,6 +1781,38 @@ export function installStoryMediaActions(win: Window): void {
 }
 
 /**
+ * Instagram drives its inbox off the Page Visibility API: when the document
+ * reports hidden — which it does whenever the host window is minimized to tray
+ * or the webview is parked offscreen — Instagram pauses its realtime socket and
+ * stops rendering conversation rows, so the monitor has nothing to diff and no
+ * new message is ever seen. Pinning the page to "visible" and swallowing
+ * visibilitychange keeps the socket live and the list populated regardless of
+ * the window state. Applied only to the dedicated inbox webview, whose sole job
+ * is detection, so it never affects what the user actually looks at.
+ */
+export function forcePageVisible(win: Window): void {
+  const doc = win.document;
+  try {
+    for (const [prop, value] of [
+      ["hidden", false],
+      ["webkitHidden", false],
+      ["visibilityState", "visible"],
+      ["webkitVisibilityState", "visible"]
+    ] as const) {
+      Object.defineProperty(doc, prop, { configurable: true, get: () => value });
+    }
+    doc.hasFocus = () => true;
+    const swallow = (event: Event) => { event.stopImmediatePropagation(); };
+    for (const type of ["visibilitychange", "webkitvisibilitychange", "blur", "freeze"]) {
+      win.addEventListener(type, swallow, true);
+      doc.addEventListener(type, swallow, true);
+    }
+  } catch (error) {
+    console.warn("[InstaDesk] could not pin page visibility", error);
+  }
+}
+
+/**
  * Runs in a dedicated background WebView pinned to the inbox list, independent
  * of whatever page or thread the visible WebView shows and independent of the
  * window being minimized/hidden, so a new message is caught no matter what the
@@ -1749,6 +1824,13 @@ export function installInboxMonitor(win: Window): void {
   if (win.__INSTADESK_INBOX_MONITOR__) return;
   win.__INSTADESK_INBOX_MONITOR__ = true;
   const seen = new Map<string, string>();
+  const wasUnread = new Map<string, boolean>();
+  const lastNotifiedAt = new Map<string, number>();
+  // Safety net beneath the time-invariant message key: even if some other
+  // volatile fragment slips into a row's preview, a single conversation can
+  // never fire more than once per this window, so a detection glitch degrades
+  // to one stray notification rather than a storm.
+  const NOTIFY_COOLDOWN_MS = 4000;
   let primed = false;
   let timer: number | undefined;
   let emptyScans = 0;
@@ -1787,15 +1869,28 @@ export function installInboxMonitor(win: Window): void {
       if (candidates.length) emptyScans = 0;
       if (!primed) {
         if (candidates.length > 0) {
-          for (const item of candidates) seen.set(item.conversationId, item.messageKey);
+          for (const item of candidates) {
+            seen.set(item.conversationId, item.messageKey);
+            wasUnread.set(item.conversationId, item.unread);
+          }
           primed = true;
           report("inbox monitor primed", `${seen.size} conversations`);
         }
         return;
       }
+      const now = Date.now();
       for (const item of candidates) {
-        if (seen.get(item.conversationId) === item.messageKey) continue;
+        // A new message shows up as either the last-message text changing or the
+        // row flipping from read to unread; the latter also catches an identical
+        // message sent again after the previous one was read.
+        const textChanged = seen.get(item.conversationId) !== item.messageKey;
+        const becameUnread = item.unread && !(wasUnread.get(item.conversationId) ?? false);
         seen.set(item.conversationId, item.messageKey);
+        wasUnread.set(item.conversationId, item.unread);
+        if (!textChanged && !becameUnread) continue;
+        const lastAt = lastNotifiedAt.get(item.conversationId) ?? 0;
+        if (now - lastAt < NOTIFY_COOLDOWN_MS) continue;
+        lastNotifiedAt.set(item.conversationId, now);
         report("incoming message detected", `${item.kind} ${item.event}${item.muted ? " (muted)" : ""} from ${item.sender} via ${inboxRowSource(win.document)} on ${win.location.pathname}`);
         void win.__TAURI_INTERNALS__?.invoke("incoming_message", { message: item }).catch((error) => console.warn("[InstaDesk] native dispatch failed", error));
       }
@@ -1813,6 +1908,9 @@ if (typeof window !== "undefined" && location.hostname.endsWith("instagram.com")
   installRemoteIpcFallback(window);
   installGhostStories(window);
   if (window.__INSTADESK_ROLE__ === "inbox") {
+    // Pin visibility at document-start, before Instagram's own scripts read it,
+    // so the realtime socket and inbox rendering never pause on a hidden window.
+    forcePageVisible(window);
     const start = () => installInboxMonitor(window);
     if (document.body) start();
     else document.addEventListener("DOMContentLoaded", start, { once: true });
