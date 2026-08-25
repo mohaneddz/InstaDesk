@@ -10,7 +10,6 @@
     "allow-settings-ui-ready",
     "allow-window-action",
     "autostart:default",
-    "notification:default",
     "core:window:allow-start-dragging",
     "core:window:allow-hide"
   ]
