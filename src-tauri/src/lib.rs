@@ -685,10 +685,16 @@ fn incoming_message(app: AppHandle, webview: Webview, message: InboxMessage) -> 
             return Ok(());
         }
     }
-    let key = format!("{}:{}", message.conversation_id, message.message_key);
-    if !is_new_message(&state, key) {
-        eprintln!("[InstaDesk] duplicate ignored");
-        return Ok(());
+    // Typing carries the same key on every occurrence and is already reduced to
+    // one notification per burst by the monitor's rising-edge dedup, so it skips
+    // the message-text dedup that would otherwise let it through only once per
+    // app session and treat every later typing burst as a duplicate.
+    if message.event != "typing" {
+        let key = format!("{}:{}", message.conversation_id, message.message_key);
+        if !is_new_message(&state, key) {
+            eprintln!("[InstaDesk] duplicate ignored");
+            return Ok(());
+        }
     }
     let body = if settings.notification_previews {
         message.preview
