@@ -1337,6 +1337,7 @@ mod tests {
             settings: Mutex::new(Settings::default()),
             dedup: Mutex::new((HashSet::new(), VecDeque::new())),
             quitting: AtomicBool::new(false),
+            window_shown: AtomicBool::new(true),
         };
         assert!(is_new_message(&state, "thread:message".into()));
         assert!(!is_new_message(&state, "thread:message".into()));
