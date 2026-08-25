@@ -26,6 +26,12 @@ const TITLEBAR_HEIGHT: f64 = 38.0;
 /// webview's polling timers and silently stops new-message detection. The
 /// `--disable-features=...` prefix has to be repeated here because setting
 /// additional browser args replaces wry's own default rather than appending.
+///
+/// Must be applied to every webview that shares the default data directory
+/// (main, instagram, inbox, settings): WebView2 fails to create a webview
+/// whose environment options differ from another already running against
+/// the same data directory, which otherwise shows up as a blank white
+/// webview and an app that stops responding.
 const KEEP_RUNNING_IN_BACKGROUND_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding";
 
 
@@ -379,7 +385,8 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
     let size = window.inner_size()?;
     let chrome_height = (TITLEBAR_HEIGHT * window.scale_factor().unwrap_or(1.0)).round() as u32;
     window.add_child(
-        WebviewBuilder::new("main", WebviewUrl::App("index.html".into())),
+        WebviewBuilder::new("main", WebviewUrl::App("index.html".into()))
+            .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS),
         PhysicalPosition::new(0, 0),
         PhysicalSize::new(size.width, chrome_height),
     )?;
@@ -443,6 +450,7 @@ fn create_settings_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             .visible(false)
             .background_color(Color(17, 17, 22, 255))
             .center()
+            .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS)
             .build()?;
     let handle = app.clone();
     window.on_window_event(move |event| {
