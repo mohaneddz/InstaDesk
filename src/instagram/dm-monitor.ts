@@ -176,7 +176,13 @@ export interface InboxCandidate {
 }
 
 const REACTION_RE = /(?:liked your message|reacted (?:\S+ )?to your message|reacted to (?:your|a) message)/i;
-const TYPING_RE = /(?:is typing|typing…|typing\.\.\.)/i;
+// Instagram animates the "…" of a typing indicator as separate dot elements
+// that carry no text, so the row's preview extracts as a bare "Typing". The
+// first branch matches that whole-preview form (with or without any trailing
+// ellipsis); anchoring it keeps an ordinary message that merely contains the
+// word ("stop typing so loud") from being mistaken for the indicator. The
+// second branch matches Instagram's "<name> is typing" phrasing wherever it sits.
+const TYPING_RE = /^\s*typing\s*(?:…|\.{1,3})?\s*$|is typing/i;
 const STORY_REPLY_RE = /(?:replied to your story|sent a story reply|reacted to your story|mentioned you in (?:their|a) story)/i;
 const NOTE_REPLY_RE = /(?:replied to your note|reacted to your note)/i;
 
@@ -381,12 +387,12 @@ export function parseInboxList(document: Document, origin = "https://www.instagr
   return inboxRowElements(document).flatMap((row) => {
     const conversationId = rowConversationId(row);
     if (!conversationId) return [];
-    const typing = inboxRowTyping(row);
-    let preview = inboxRowPreview(row);
-    // The typing indicator has no message text of its own, so stand in a preview
-    // for it when the row shows one — otherwise the empty/stale text below drops
-    // the row or misclassifies it as an ordinary message.
-    if (typing && inboxEventKind(preview) !== "typing") preview = "is typing…";
+    const rawPreview = inboxRowPreview(row);
+    // A typing indicator surfaces either as its accessibility label or as the
+    // bare "Typing" text the classifier recognises; in both cases its own
+    // message text is meaningless, so a stable preview stands in for it.
+    const typing = inboxRowTyping(row) || inboxEventKind(rawPreview) === "typing";
+    const preview = typing ? "is typing…" : rawPreview;
     // A typing indicator is never the user's own message, so it bypasses the
     // own-message guard that would otherwise discard a row previewing "You: …".
     if (!preview || (!typing && isOwnLastMessage(row, preview))) return [];

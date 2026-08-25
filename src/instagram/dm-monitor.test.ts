@@ -320,6 +320,9 @@ describe("inbox event classifier", () => {
     expect(inboxEventKind("Liked your message")).toBe("reaction");
     expect(inboxEventKind("Reacted 😂 to your message")).toBe("reaction");
     expect(inboxEventKind("Sarah is typing")).toBe("typing");
+    expect(inboxEventKind("Typing")).toBe("typing");
+    expect(inboxEventKind("Typing…")).toBe("typing");
+    expect(inboxEventKind("stop typing so loud")).toBe("message");
     expect(inboxEventKind("Replied to your story")).toBe("storyReply");
     expect(inboxEventKind("Replied to your note")).toBe("noteReply");
     expect(inboxEventKind("bro look at this")).toBe("message");
@@ -345,6 +348,12 @@ describe("inbox event classifier", () => {
     document.body.innerHTML = '<main><a href="/direct/t/7/"><span>Sarah</span><span>see you then · 2m</span><img src="/a.jpg"><div aria-label="Sarah is typing"></div></a></main>';
     const [item] = parseInboxList(document);
     expect(item).toMatchObject({ event: "typing", sender: "Sarah", preview: "is typing…" });
+  });
+
+  it("detects a typing indicator rendered as the bare 'Typing' text with animated dots", () => {
+    document.body.innerHTML = '<main><a href="/direct/t/9/"><span>ProbablyHim</span><span>Typing</span><span>.</span><span>.</span><span>.</span><img src="/a.jpg"></a></main>';
+    const [item] = parseInboxList(document);
+    expect(item).toMatchObject({ event: "typing", sender: "ProbablyHim", preview: "is typing…" });
   });
 
   it("does not treat a message that mentions typing as the typing indicator", () => {

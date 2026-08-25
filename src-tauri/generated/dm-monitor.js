@@ -178,7 +178,7 @@
     return { kind: "unknown" };
   }
   var REACTION_RE = /(?:liked your message|reacted (?:\S+ )?to your message|reacted to (?:your|a) message)/i;
-  var TYPING_RE = /(?:is typing|typing…|typing\.\.\.)/i;
+  var TYPING_RE = /^\s*typing\s*(?:…|\.{1,3})?\s*$|is typing/i;
   var STORY_REPLY_RE = /(?:replied to your story|sent a story reply|reacted to your story|mentioned you in (?:their|a) story)/i;
   var NOTE_REPLY_RE = /(?:replied to your note|reacted to your note)/i;
   function inboxEventKind(preview) {
@@ -285,9 +285,9 @@
     return inboxRowElements(document2).flatMap((row) => {
       const conversationId = rowConversationId(row);
       if (!conversationId) return [];
-      const typing = inboxRowTyping(row);
-      let preview = inboxRowPreview(row);
-      if (typing && inboxEventKind(preview) !== "typing") preview = "is typing\u2026";
+      const rawPreview = inboxRowPreview(row);
+      const typing = inboxRowTyping(row) || inboxEventKind(rawPreview) === "typing";
+      const preview = typing ? "is typing\u2026" : rawPreview;
       if (!preview || !typing && isOwnLastMessage(row, preview)) return [];
       const threadId = rowThreadId(row);
       return [{
