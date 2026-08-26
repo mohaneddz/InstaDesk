@@ -75,6 +75,14 @@ Defaults are notifications on, startup off, minimize to tray on, and previews on
 
 Content controls for Home, Reels, Explore, and Search default to off. When enabled, their navigation entries are hidden and attempts to open blocked routes are redirected to the DM inbox. Authentication, account settings, profiles, posts, and direct-message routes remain available.
 
+### Settings screenshots
+
+<p align="center">
+  <img src="screenshot/settings1.png" alt="InstaDesk notification and startup settings" width="32%" />
+  <img src="screenshot/settings2.png" alt="InstaDesk privacy, chat visibility, and keyboard shortcut settings" width="32%" />
+  <img src="screenshot/settings3.png" alt="InstaDesk sender filter and content control settings" width="32%" />
+</p>
+
 ## Troubleshooting Instagram frontend changes
 
 1. Open the affected private thread and inspect the WebView console in a debug build.
