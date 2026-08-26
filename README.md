@@ -1,10 +1,29 @@
-# InstaDesk
+<h1 style="font-family: Arial, sans-serif; font-size: 36px; display: flex; align-items: center; border-bottom: 3px solid; padding-bottom: 5px;">
+  <img src="icon.svg" alt="InstaDesk icon" style="height: 55px; margin-right: 15px; object-fit: cover;" />
+  InstaDesk - Instagram Desktop Wrapper
+</h1>
 
 InstaDesk is a lightweight, unofficial Windows desktop wrapper for the official Instagram website. It is built with Tauri 2 and focuses on conservative native notifications for one-to-one direct messages.
 
+<div align="center">
+  <img src="screenshot/settings1.png" alt="InstaDesk notification and startup settings" width="31%" />
+  <img src="screenshot/settings2.png" alt="InstaDesk privacy, chat visibility, and keyboard shortcut settings" width="31%" />
+  <img src="screenshot/settings3.png" alt="InstaDesk sender filter and content control settings" width="31%" />
+</div>
+
+---
+
+## ⚠️ Disclaimer
+
 > InstaDesk is not affiliated with, endorsed by, or distributed by Instagram or Meta. Instagram remains responsible for its website, authentication, and account behavior.
 
-## What it does
+---
+
+## 📌 Overview
+
+InstaDesk loads Instagram directly in a persistent Windows WebView2 profile, keeping the experience lightweight while adding native desktop controls, tray behavior, and carefully scoped direct-message notifications.
+
+## 🚀 Features
 
 - Loads `https://www.instagram.com/` directly in a persistent WebView2 profile.
 - Keeps login cookies in the app-specific WebView2 data directory between launches.
@@ -16,13 +35,13 @@ InstaDesk is a lightweight, unofficial Windows desktop wrapper for the official 
 - Restores the window and opens the matching thread when a toast is clicked; invalid destinations fall back to the inbox.
 - Stores only local settings and transient deduplication keys. It does not store credentials or message history.
 
-## Important notification scope
+## 🔔 Important notification scope
 
 The observer is intentionally fail-closed. It only accepts a candidate while an Instagram `/direct/t/<id>` conversation is rendered and the conversation header proves that exactly one peer profile is present. It rejects group/ambiguous headers, messages labelled as sent by the user, non-DM routes, and unrelated activity. Existing incoming messages are recorded as a baseline when a thread first opens, so they do not produce startup notifications.
 
 This conservative approach avoids leaking broad Instagram activity into native notifications, but has a practical limitation: Instagram does not expose a supported DM API to wrappers, so a new message can only be detected when Instagram renders that thread in the WebView. If Instagram changes its semantic DOM, detection fails silently with a diagnostic log instead of guessing. Keep Instagram’s inbox or the relevant conversation open for monitoring. A future official API would be preferable if Meta exposes one for this use case.
 
-## Architecture
+## 🏗️ Architecture
 
 - `src/instagram/dm-monitor.ts` contains all Instagram-specific selectors, classification, baseline, MutationObserver, and browser-side deduplication.
 - `src-tauri/src/lib.rs` owns the remote WebView, strict Instagram-only navigation, settings persistence, tray lifecycle, native deduplication, Windows toast dispatch, and click restoration.
@@ -31,7 +50,16 @@ This conservative approach avoids leaking broad Instagram activity into native n
 
 The remote Instagram page receives only the constrained `incoming_private_dm` command. The native side independently validates the HTTPS Instagram thread URL and required message fields before dispatching a toast.
 
-## Requirements
+## 🛠️ Tech Stack
+
+![Tauri](https://img.shields.io/badge/Tauri_2-FFC131?style=for-the-badge&logo=tauri&logoColor=black) **Tauri 2** – native desktop shell, tray lifecycle, and Windows notifications
+![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white) **TypeScript** – Instagram DOM monitoring and frontend logic
+![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white) **Rust** – native window, settings, and notification management
+![Vite](https://img.shields.io/badge/Vite-646CFF?style=for-the-badge&logo=vite&logoColor=white) **Vite** – frontend build tool
+
+---
+
+## ⚙️ Requirements
 
 - Windows 10/11 with Microsoft Edge WebView2 Runtime
 - Node.js 20 or later
@@ -39,7 +67,19 @@ The remote Instagram page receives only the constrained `incoming_private_dm` co
 - Tauri’s Windows build prerequisites (Visual Studio C++ Build Tools and WebView2)
 - WiX/NSIS are downloaded or located by the Tauri CLI during bundling
 
-## Development
+---
+
+## ⚙️ Installation
+
+```powershell
+git clone https://github.com/mohaneddz/InstaDesk
+cd InstaDesk
+npm install
+```
+
+---
+
+## 🚀 Development
 
 ```powershell
 npm install
@@ -57,7 +97,9 @@ Use `--open-settings` in a debug launch to open the settings dialog immediately 
 
 Both use the same `dispatch_notification` function as a real parsed DM. The test entry is disabled in release builds.
 
-## Production build
+---
+
+## 📦 Production Build
 
 ```powershell
 npm run desktop:build
@@ -69,21 +111,17 @@ Outputs:
 - `src-tauri/target/release/bundle/nsis/InstaDesk_0.1.0_x64-setup.exe`
 - `src-tauri/target/release/bundle/msi/InstaDesk_0.1.0_x64_en-US.msi`
 
-## Settings and privacy
+---
+
+## 🔒 Settings and Privacy
 
 Defaults are notifications on, startup off, minimize to tray on, and previews on. Settings are saved under the Tauri app-data directory as `settings.json`. WebView2 owns cookies in its app-specific profile; InstaDesk never receives or saves the Instagram password, cookies, tokens, or credentials. Deduplication metadata is memory-only and capped at 1,000 keys.
 
 Content controls for Home, Reels, Explore, and Search default to off. When enabled, their navigation entries are hidden and attempts to open blocked routes are redirected to the DM inbox. Authentication, account settings, profiles, posts, and direct-message routes remain available.
 
-### Settings screenshots
+---
 
-<p align="center">
-  <img src="screenshot/settings1.png" alt="InstaDesk notification and startup settings" width="32%" />
-  <img src="screenshot/settings2.png" alt="InstaDesk privacy, chat visibility, and keyboard shortcut settings" width="32%" />
-  <img src="screenshot/settings3.png" alt="InstaDesk sender filter and content control settings" width="32%" />
-</p>
-
-## Troubleshooting Instagram frontend changes
+## 🧰 Troubleshooting Instagram Frontend Changes
 
 1. Open the affected private thread and inspect the WebView console in a debug build.
 2. Look for `[InstaDesk] DM observer installed`, baseline, classification, or parsing-failure messages.
