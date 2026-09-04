@@ -152,6 +152,9 @@ fn default_event() -> String {
 struct AppState {
     settings: Mutex<Settings>,
     dedup: Mutex<(HashSet<String>, VecDeque<String>)>,
+    /// Keep one menu alive for the lifetime of the app. Rebuilding a tray from
+    /// inside its own callback leaves old global menu listeners registered.
+    tray_menu: Mutex<Option<Menu<tauri::Wry>>>,
     /// Uses an AtomicBool rather than a Mutex<bool> for lock-free reads in the
     /// CloseRequested handler.
     quitting: AtomicBool,
@@ -220,7 +223,7 @@ fn show_instagram<R: Runtime>(app: &AppHandle<R>, destination: Option<&str>) {
 
 fn hide_main_window<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
     if let Some(settings) = app.get_webview_window("settings") {
-        let _ = settings.hide();
+        let _ = settings.close();
     }
     set_window_shown(app, false);
     leave_open_thread(app);
@@ -262,24 +265,7 @@ fn leave_open_thread<R: Runtime>(app: &AppHandle<R>) {
 /// non-modifier key is delivered by the OS and does not depend on focus.
 pub const TOGGLE_SHORTCUT: &str = "Ctrl+Alt+I";
 
-fn install_toggle_shortcut<R: Runtime>(app: &AppHandle<R>) {
-    use tauri_plugin_global_shortcut::ShortcutState;
-
-    let handle = app.clone();
-    let registered = app.plugin(
-        tauri_plugin_global_shortcut::Builder::new()
-            .with_handler(move |_app, _shortcut, event| {
-                // Fire once per press; the OS repeats the key while it is held.
-                if event.state() == ShortcutState::Pressed {
-                    toggle_main_window(&handle);
-                }
-            })
-            .build(),
-    );
-    if let Err(error) = registered {
-        eprintln!("[InstaDesk] global shortcut plugin unavailable: {error}");
-        return;
-    }
+fn register_toggle_shortcut<R: Runtime>(app: &AppHandle<R>) {
     if let Err(error) = app.global_shortcut().register(TOGGLE_SHORTCUT) {
         eprintln!("[InstaDesk] could not register {TOGGLE_SHORTCUT}: {error}");
     }
@@ -289,16 +275,14 @@ fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
     let Some(window) = app.get_window("main") else {
         return;
     };
-    let visible = window.is_visible().unwrap_or(false);
     let minimized = window.is_minimized().unwrap_or(false);
-    let focused = window.is_focused().unwrap_or(false);
-    if visible && !minimized && focused {
+    // A child WebView owns focus while the user interacts with Instagram, so
+    // Window::is_focused() is not a reliable test for whether the app is shown.
+    let shown = app.state::<AppState>().window_shown.load(Ordering::SeqCst);
+    if shown && !minimized {
         hide_main_window(app, &window);
     } else {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-        set_window_shown(app, true);
+        show_instagram(app, None);
     }
 }
 
@@ -468,32 +452,30 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
 }
 
 fn create_settings_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
-    let window =
-        WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("settings.html".into()))
-            .title("InstaDesk Settings")
-            .inner_size(510.0, 520.0)
-            .min_inner_size(510.0, 520.0)
-            .resizable(false)
-            .maximizable(false)
-            .decorations(false)
-            .visible(false)
-            .background_color(Color(17, 17, 22, 255))
-            .center()
-            .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS)
-            .build()?;
-    let handle = app.clone();
-    window.on_window_event(move |event| {
-        if let WindowEvent::CloseRequested { api, .. } = event {
-            api.prevent_close();
-            if let Some(window) = handle.get_webview_window("settings") {
-                let _ = window.hide();
-            }
-        }
-    });
+    WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("settings.html".into()))
+        .title("InstaDesk Settings")
+        .inner_size(510.0, 520.0)
+        .min_inner_size(510.0, 520.0)
+        .resizable(false)
+        .maximizable(false)
+        .decorations(false)
+        .visible(false)
+        .background_color(Color(17, 17, 22, 255))
+        .center()
+        .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS)
+        .build()?;
     Ok(())
 }
 
 fn show_settings<R: Runtime>(app: &AppHandle<R>) {
+    // This dialog is infrequently used. Create it on demand and really close
+    // it when dismissed so its WebView2 document does not remain resident.
+    if app.get_webview_window("settings").is_none() {
+        if let Err(error) = create_settings_window(app) {
+            eprintln!("[InstaDesk] could not create settings window: {error}");
+            return;
+        }
+    }
     let Some(window) = app.get_webview_window("settings") else {
         eprintln!("[InstaDesk] settings window is unavailable");
         return;
@@ -755,8 +737,7 @@ fn update_settings(
         *current = settings.clone();
     }
     save_settings(&app, &settings);
-    let _ = app.remove_tray_by_id("instadesk-tray");
-    build_tray(&app, &settings).map_err(|error| error.to_string())?;
+    update_tray_checkmarks(&app, &settings);
     if let Some(instagram) = app.get_webview("instagram") {
         let settings_json = serde_json::to_string(&settings).map_err(|error| error.to_string())?;
         let _ = instagram.eval(format!(
@@ -1058,7 +1039,7 @@ fn window_action(app: AppHandle, webview: Webview, action: &str) -> Result<(), S
             .map_err(|e| e.to_string())?,
         ("main" | "instagram" | "settings", "toggle_window") => toggle_main_window(&app),
         ("settings", "drag_settings") => window.start_dragging().map_err(|e| e.to_string())?,
-        ("settings", "close_settings") => window.hide().map_err(|e| e.to_string())?,
+        ("settings", "close_settings") => window.close().map_err(|e| e.to_string())?,
         _ => return Err("Window action is not allowed for this WebView".into()),
     }
     Ok(())
@@ -1085,11 +1066,9 @@ fn set_autostart<R: Runtime>(app: &AppHandle<R>, enabled: bool) {
     }
 }
 
-fn toggle_setting<R: Runtime>(app: &AppHandle<R>, field: &str) {
+fn toggle_setting(app: &AppHandle, field: &str) {
     let state = app.state::<AppState>();
-    // Clone settings out of the lock before rebuilding the tray, so the lock
-    // is not held when build_tray registers menu-event closures that may later
-    // try to acquire it.
+    // Clone settings out of the lock before calling native menu/WebView APIs.
     let settings = {
         let Ok(mut guard) = state.settings.lock() else { return; };
         match field {
@@ -1115,12 +1094,37 @@ fn toggle_setting<R: Runtime>(app: &AppHandle<R>, field: &str) {
         }
         guard.clone()
     }; // settings lock released here
-    // Rebuild the tray so checkmarks reflect the new value immediately.
-    let _ = app.remove_tray_by_id("instadesk-tray");
-    let _ = build_tray(app, &settings);
+    update_tray_checkmarks(app, &settings);
 }
 
-fn build_tray<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> tauri::Result<()> {
+fn update_tray_checkmarks(app: &AppHandle, settings: &Settings) {
+    let menu = app
+        .state::<AppState>()
+        .tray_menu
+        .lock()
+        .ok()
+        .and_then(|menu| menu.clone());
+    let Some(menu) = menu else {
+        return;
+    };
+    for (id, checked) in [
+        ("notifyPrivate", settings.notify_private),
+        ("notifyGroup", settings.notify_group),
+        ("previews", settings.notification_previews),
+        ("minimize", settings.minimize_to_tray),
+        ("autostart", settings.launch_at_startup),
+        ("hidePrivateChats", settings.hide_private_chats),
+        ("hideGroupChats", settings.hide_group_chats),
+    ] {
+        if let Some(item) = menu.get(id) {
+            if let Some(check) = item.as_check_menuitem() {
+                let _ = check.set_checked(checked);
+            }
+        }
+    }
+}
+
+fn build_tray(app: &AppHandle, settings: &Settings) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open Instagram", true, None::<&str>)?;
     let dms = MenuItem::with_id(app, "dms", "Open DMs", true, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
@@ -1211,6 +1215,8 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> tauri::Res
         )
         .tooltip("InstaDesk — Unofficial Instagram wrapper")
         .menu(&menu)
+        // Left-click toggles the app; right-click owns the context menu.
+        .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => show_instagram(app, None),
             "dms" => show_instagram(app, Some(INSTAGRAM_INBOX)),
@@ -1235,19 +1241,19 @@ fn build_tray<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> tauri::Res
         .on_tray_icon_event(|tray, event| {
             if matches!(
                 event,
-                TrayIconEvent::DoubleClick {
-                    button: MouseButton::Left,
-                    ..
-                } | TrayIconEvent::Click {
+                TrayIconEvent::Click {
                     button: MouseButton::Left,
                     button_state: MouseButtonState::Up,
                     ..
                 }
             ) {
-                show_instagram(tray.app_handle(), None);
+                toggle_main_window(tray.app_handle());
             }
         })
         .build(app)?;
+    if let Ok(mut current) = app.state::<AppState>().tray_menu.lock() {
+        *current = Some(menu);
+    }
     Ok(())
 }
 
@@ -1263,6 +1269,16 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_instagram(app, None);
         }))
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    use tauri_plugin_global_shortcut::ShortcutState;
+                    if event.state() == ShortcutState::Pressed {
+                        toggle_main_window(app);
+                    }
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--hidden"])))
         .invoke_handler(tauri::generate_handler![incoming_message, report_diagnostic, get_settings, update_settings, get_content_controls, window_action, settings_ui_ready, download_media, copy_image])
         .setup(|app| {
@@ -1271,11 +1287,11 @@ pub fn run() {
             app.manage(AppState {
                 settings: Mutex::new(settings.clone()),
                 dedup: Mutex::new((HashSet::new(), VecDeque::new())),
+                tray_menu: Mutex::new(None),
                 quitting: AtomicBool::new(false),
                 window_shown: AtomicBool::new(!launched_hidden),
             });
             build_tray(app.handle(), &settings)?;
-            create_settings_window(app.handle())?;
             let window = create_main_window(app.handle())?;
             #[cfg(windows)]
             {
@@ -1286,7 +1302,7 @@ pub fn run() {
                 }
                 ensure_windows_shortcut_registered();
             }
-            install_toggle_shortcut(app.handle());
+            register_toggle_shortcut(app.handle());
             if launched_hidden { let _ = window.hide(); }
             if std::env::args().any(|arg| arg == "--open-settings") { show_settings(app.handle()); }
             #[cfg(debug_assertions)]
@@ -1336,6 +1352,7 @@ mod tests {
         let state = AppState {
             settings: Mutex::new(Settings::default()),
             dedup: Mutex::new((HashSet::new(), VecDeque::new())),
+            tray_menu: Mutex::new(None),
             quitting: AtomicBool::new(false),
             window_shown: AtomicBool::new(true),
         };

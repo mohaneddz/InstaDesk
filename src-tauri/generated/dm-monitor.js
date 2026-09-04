@@ -1,6 +1,6 @@
 "use strict";
 (() => {
-  // node_modules/.pnpm/@tauri-apps+api@2.11.1/node_modules/@tauri-apps/api/external/tslib/tslib.es6.js
+  // node_modules/@tauri-apps/api/external/tslib/tslib.es6.js
   function __classPrivateFieldGet(receiver, state, kind, f) {
     if (kind === "a" && !f) throw new TypeError("Private accessor was defined without a getter");
     if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot read private member from an object whose class did not declare it");
@@ -13,7 +13,7 @@
     return kind === "a" ? f.call(receiver, value) : f ? f.value = value : state.set(receiver, value), value;
   }
 
-  // node_modules/.pnpm/@tauri-apps+api@2.11.1/node_modules/@tauri-apps/api/core.js
+  // node_modules/@tauri-apps/api/core.js
   var _Channel_onmessage;
   var _Channel_nextMessageIndex;
   var _Channel_pendingMessages;
@@ -1026,6 +1026,17 @@
   var userStoryReels = /* @__PURE__ */ new Map();
   var storyItemMap = /* @__PURE__ */ new Map();
   var userVideoUrls = /* @__PURE__ */ new Map();
+  var MAX_CACHED_STORY_USERS = 64;
+  var MAX_CACHED_STORY_KEYS = 800;
+  function boundedMapSet(map, key, value, limit) {
+    if (map.has(key)) map.delete(key);
+    map.set(key, value);
+    while (map.size > limit) {
+      const oldest = map.keys().next().value;
+      if (oldest === void 0) break;
+      map.delete(oldest);
+    }
+  }
   function recordVideoRequest(url, win) {
     if (!url || !/\.mp4(\?|$)|cdninstagram\.com\/o1\/v\/|fbcdn\.net\/v\//i.test(url)) return;
     const username = win ? getFocusedUsername(win, getCenteredStoryContainer(win)) : "";
@@ -1033,7 +1044,7 @@
       let list = userVideoUrls.get(username);
       if (!list) {
         list = [];
-        userVideoUrls.set(username, list);
+        boundedMapSet(userVideoUrls, username, list, MAX_CACHED_STORY_USERS);
       }
       if (!list.includes(url)) {
         list.push(url);
@@ -1099,14 +1110,14 @@
           } else {
             genuineItems.push(storyItem);
           }
-          storyItemMap.set(id, storyItem);
-          if (rawItem.id) storyItemMap.set(String(rawItem.id).toLowerCase(), storyItem);
-          if (rawItem.pk) storyItemMap.set(String(rawItem.pk).toLowerCase(), storyItem);
-          if (rawItem.code) storyItemMap.set(String(rawItem.code).toLowerCase(), storyItem);
+          boundedMapSet(storyItemMap, id, storyItem, MAX_CACHED_STORY_KEYS);
+          if (rawItem.id) boundedMapSet(storyItemMap, String(rawItem.id).toLowerCase(), storyItem, MAX_CACHED_STORY_KEYS);
+          if (rawItem.pk) boundedMapSet(storyItemMap, String(rawItem.pk).toLowerCase(), storyItem, MAX_CACHED_STORY_KEYS);
+          if (rawItem.code) boundedMapSet(storyItemMap, String(rawItem.code).toLowerCase(), storyItem, MAX_CACHED_STORY_KEYS);
         }
       }
       if (genuineItems.length > 0) {
-        userStoryReels.set(username, genuineItems);
+        boundedMapSet(userStoryReels, username, genuineItems.slice(-100), MAX_CACHED_STORY_USERS);
       }
     }
     if ((data.id || data.pk) && (data.video_versions || data.image_versions2 || data.display_url || data.video_url)) {
@@ -1126,21 +1137,22 @@
           url,
           thumbUrl: imageUrl
         };
-        storyItemMap.set(id, storyItem);
-        if (data.id) storyItemMap.set(String(data.id).toLowerCase(), storyItem);
-        if (data.pk) storyItemMap.set(String(data.pk).toLowerCase(), storyItem);
-        if (data.code) storyItemMap.set(String(data.code).toLowerCase(), storyItem);
+        boundedMapSet(storyItemMap, id, storyItem, MAX_CACHED_STORY_KEYS);
+        if (data.id) boundedMapSet(storyItemMap, String(data.id).toLowerCase(), storyItem, MAX_CACHED_STORY_KEYS);
+        if (data.pk) boundedMapSet(storyItemMap, String(data.pk).toLowerCase(), storyItem, MAX_CACHED_STORY_KEYS);
+        if (data.code) boundedMapSet(storyItemMap, String(data.code).toLowerCase(), storyItem, MAX_CACHED_STORY_KEYS);
         if (username) {
           let reel = userStoryReels.get(username);
           if (!reel) {
             reel = [];
-            userStoryReels.set(username, reel);
+            boundedMapSet(userStoryReels, username, reel, MAX_CACHED_STORY_USERS);
           }
           const existingIdx = reel.findIndex((x) => x.id === id || storyItem.pk && x.pk === storyItem.pk);
           if (existingIdx >= 0) {
             reel[existingIdx] = storyItem;
           } else {
             reel.push(storyItem);
+            if (reel.length > 100) reel.shift();
           }
         }
       }
@@ -1511,6 +1523,7 @@
     const lastNotifiedAt = /* @__PURE__ */ new Map();
     const typingActive = /* @__PURE__ */ new Map();
     const lastTypingAt = /* @__PURE__ */ new Map();
+    const MAX_TRACKED_CONVERSATIONS = 500;
     const NOTIFY_COOLDOWN_MS = 4e3;
     const TYPING_COOLDOWN_MS = 12e3;
     let primed = false;
@@ -1549,8 +1562,8 @@
           if (candidates.length > 0) {
             for (const item of candidates) {
               if (item.event === "typing") continue;
-              seen.set(item.conversationId, item.messageKey);
-              wasUnread.set(item.conversationId, item.unread);
+              boundedMapSet(seen, item.conversationId, item.messageKey, MAX_TRACKED_CONVERSATIONS);
+              boundedMapSet(wasUnread, item.conversationId, item.unread, MAX_TRACKED_CONVERSATIONS);
             }
             primed = true;
             report("inbox monitor primed", `${seen.size} conversations`);
@@ -1565,22 +1578,22 @@
         for (const item of candidates) {
           if (item.event === "typing") {
             const wasTyping = typingActive.get(item.conversationId) ?? false;
-            typingActive.set(item.conversationId, true);
+            boundedMapSet(typingActive, item.conversationId, true, MAX_TRACKED_CONVERSATIONS);
             const lastAt2 = lastTypingAt.get(item.conversationId) ?? 0;
             if (wasTyping || now - lastAt2 < TYPING_COOLDOWN_MS) continue;
-            lastTypingAt.set(item.conversationId, now);
+            boundedMapSet(lastTypingAt, item.conversationId, now, MAX_TRACKED_CONVERSATIONS);
             dispatch(item);
             continue;
           }
-          typingActive.set(item.conversationId, false);
+          boundedMapSet(typingActive, item.conversationId, false, MAX_TRACKED_CONVERSATIONS);
           const textChanged = seen.get(item.conversationId) !== item.messageKey;
           const becameUnread = item.unread && !(wasUnread.get(item.conversationId) ?? false);
-          seen.set(item.conversationId, item.messageKey);
-          wasUnread.set(item.conversationId, item.unread);
+          boundedMapSet(seen, item.conversationId, item.messageKey, MAX_TRACKED_CONVERSATIONS);
+          boundedMapSet(wasUnread, item.conversationId, item.unread, MAX_TRACKED_CONVERSATIONS);
           if (!textChanged && !becameUnread) continue;
           const lastAt = lastNotifiedAt.get(item.conversationId) ?? 0;
           if (now - lastAt < NOTIFY_COOLDOWN_MS) continue;
-          lastNotifiedAt.set(item.conversationId, now);
+          boundedMapSet(lastNotifiedAt, item.conversationId, now, MAX_TRACKED_CONVERSATIONS);
           dispatch(item);
         }
       } catch (error) {

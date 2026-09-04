@@ -1262,6 +1262,23 @@ export const userStoryReels = new Map<string, StoryItem[]>();
 export const storyItemMap = new Map<string, StoryItem>();
 export const userVideoUrls = new Map<string, string[]>();
 
+// Instagram is a long-lived single-page app, so module-level media caches live
+// until InstaDesk exits. Keep recent entries only instead of retaining every
+// story/user encountered during a multi-day tray session.
+const MAX_CACHED_STORY_USERS = 64;
+const MAX_CACHED_STORY_KEYS = 800;
+
+function boundedMapSet<K, V>(map: Map<K, V>, key: K, value: V, limit: number): void {
+  // Refresh insertion order when replacing an entry so active items survive.
+  if (map.has(key)) map.delete(key);
+  map.set(key, value);
+  while (map.size > limit) {
+    const oldest = map.keys().next().value as K | undefined;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
+
 export function recordVideoRequest(url: string, win?: Window): void {
   if (!url || !/\.mp4(\?|$)|cdninstagram\.com\/o1\/v\/|fbcdn\.net\/v\//i.test(url)) return;
   const username = win ? getFocusedUsername(win, getCenteredStoryContainer(win)) : "";
@@ -1269,7 +1286,7 @@ export function recordVideoRequest(url: string, win?: Window): void {
     let list = userVideoUrls.get(username);
     if (!list) {
       list = [];
-      userVideoUrls.set(username, list);
+      boundedMapSet(userVideoUrls, username, list, MAX_CACHED_STORY_USERS);
     }
     // Record only the single latest video URL for single-story fallback; never pollute story reel with chunks!
     if (!list.includes(url)) {
@@ -1356,15 +1373,15 @@ export function extractStoryMediaFromJson(data: any, inheritedUsername?: string,
         } else {
           genuineItems.push(storyItem);
         }
-        storyItemMap.set(id, storyItem);
-        if (rawItem.id) storyItemMap.set(String(rawItem.id).toLowerCase(), storyItem);
-        if (rawItem.pk) storyItemMap.set(String(rawItem.pk).toLowerCase(), storyItem);
-        if (rawItem.code) storyItemMap.set(String(rawItem.code).toLowerCase(), storyItem);
+        boundedMapSet(storyItemMap, id, storyItem, MAX_CACHED_STORY_KEYS);
+        if (rawItem.id) boundedMapSet(storyItemMap, String(rawItem.id).toLowerCase(), storyItem, MAX_CACHED_STORY_KEYS);
+        if (rawItem.pk) boundedMapSet(storyItemMap, String(rawItem.pk).toLowerCase(), storyItem, MAX_CACHED_STORY_KEYS);
+        if (rawItem.code) boundedMapSet(storyItemMap, String(rawItem.code).toLowerCase(), storyItem, MAX_CACHED_STORY_KEYS);
       }
     }
 
     if (genuineItems.length > 0) {
-      userStoryReels.set(username, genuineItems);
+      boundedMapSet(userStoryReels, username, genuineItems.slice(-100), MAX_CACHED_STORY_USERS);
     }
   }
 
@@ -1399,22 +1416,23 @@ export function extractStoryMediaFromJson(data: any, inheritedUsername?: string,
         url,
         thumbUrl: imageUrl
       };
-      storyItemMap.set(id, storyItem);
-      if (data.id) storyItemMap.set(String(data.id).toLowerCase(), storyItem);
-      if (data.pk) storyItemMap.set(String(data.pk).toLowerCase(), storyItem);
-      if (data.code) storyItemMap.set(String(data.code).toLowerCase(), storyItem);
+      boundedMapSet(storyItemMap, id, storyItem, MAX_CACHED_STORY_KEYS);
+      if (data.id) boundedMapSet(storyItemMap, String(data.id).toLowerCase(), storyItem, MAX_CACHED_STORY_KEYS);
+      if (data.pk) boundedMapSet(storyItemMap, String(data.pk).toLowerCase(), storyItem, MAX_CACHED_STORY_KEYS);
+      if (data.code) boundedMapSet(storyItemMap, String(data.code).toLowerCase(), storyItem, MAX_CACHED_STORY_KEYS);
 
       if (username) {
         let reel = userStoryReels.get(username);
         if (!reel) {
           reel = [];
-          userStoryReels.set(username, reel);
+          boundedMapSet(userStoryReels, username, reel, MAX_CACHED_STORY_USERS);
         }
         const existingIdx = reel.findIndex((x) => x.id === id || (storyItem.pk && x.pk === storyItem.pk));
         if (existingIdx >= 0) {
           reel[existingIdx] = storyItem;
         } else {
           reel.push(storyItem);
+          if (reel.length > 100) reel.shift();
         }
       }
     }
@@ -1865,6 +1883,7 @@ export function installInboxMonitor(win: Window): void {
   // new message and re-announce something already seen.
   const typingActive = new Map<string, boolean>();
   const lastTypingAt = new Map<string, number>();
+  const MAX_TRACKED_CONVERSATIONS = 500;
   // Safety net beneath the time-invariant message key: even if some other
   // volatile fragment slips into a row's preview, a single conversation can
   // never fire more than once per this window, so a detection glitch degrades
@@ -1917,8 +1936,8 @@ export function installInboxMonitor(win: Window): void {
             // key, so it is not used as the baseline; the next scan without the
             // indicator establishes it.
             if (item.event === "typing") continue;
-            seen.set(item.conversationId, item.messageKey);
-            wasUnread.set(item.conversationId, item.unread);
+            boundedMapSet(seen, item.conversationId, item.messageKey, MAX_TRACKED_CONVERSATIONS);
+            boundedMapSet(wasUnread, item.conversationId, item.unread, MAX_TRACKED_CONVERSATIONS);
           }
           primed = true;
           report("inbox monitor primed", `${seen.size} conversations`);
@@ -1935,25 +1954,25 @@ export function installInboxMonitor(win: Window): void {
           // Fire on the rising edge only, on its own cooldown, and leave the
           // message-diff state untouched so the stop transition stays silent.
           const wasTyping = typingActive.get(item.conversationId) ?? false;
-          typingActive.set(item.conversationId, true);
+          boundedMapSet(typingActive, item.conversationId, true, MAX_TRACKED_CONVERSATIONS);
           const lastAt = lastTypingAt.get(item.conversationId) ?? 0;
           if (wasTyping || now - lastAt < TYPING_COOLDOWN_MS) continue;
-          lastTypingAt.set(item.conversationId, now);
+          boundedMapSet(lastTypingAt, item.conversationId, now, MAX_TRACKED_CONVERSATIONS);
           dispatch(item);
           continue;
         }
-        typingActive.set(item.conversationId, false);
+        boundedMapSet(typingActive, item.conversationId, false, MAX_TRACKED_CONVERSATIONS);
         // A new message shows up as either the last-message text changing or the
         // row flipping from read to unread; the latter also catches an identical
         // message sent again after the previous one was read.
         const textChanged = seen.get(item.conversationId) !== item.messageKey;
         const becameUnread = item.unread && !(wasUnread.get(item.conversationId) ?? false);
-        seen.set(item.conversationId, item.messageKey);
-        wasUnread.set(item.conversationId, item.unread);
+        boundedMapSet(seen, item.conversationId, item.messageKey, MAX_TRACKED_CONVERSATIONS);
+        boundedMapSet(wasUnread, item.conversationId, item.unread, MAX_TRACKED_CONVERSATIONS);
         if (!textChanged && !becameUnread) continue;
         const lastAt = lastNotifiedAt.get(item.conversationId) ?? 0;
         if (now - lastAt < NOTIFY_COOLDOWN_MS) continue;
-        lastNotifiedAt.set(item.conversationId, now);
+        boundedMapSet(lastNotifiedAt, item.conversationId, now, MAX_TRACKED_CONVERSATIONS);
         dispatch(item);
       }
     } catch (error) { console.warn("[InstaDesk] inbox parsing failure", error); }
