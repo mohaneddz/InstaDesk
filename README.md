@@ -1,3 +1,5 @@
+![InstaDesk](screenshots/cover.avif)
+
 <h1 style="font-family: Arial, sans-serif; font-size: 36px; display: flex; align-items: center; border-bottom: 3px solid; padding-bottom: 5px;">
   <img src="public/icon.webp" alt="InstaDesk icon" style="height: 55px; margin-right: 15px; object-fit: cover;" />
   InstaDesk - Instagram Desktop Wrapper
