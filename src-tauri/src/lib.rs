@@ -179,7 +179,10 @@ fn settings_path<R: Runtime>(app: &AppHandle<R>) -> Option<std::path::PathBuf> {
 fn load_settings<R: Runtime>(app: &AppHandle<R>) -> Settings {
     settings_path(app)
         .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
+        // A leading BOM (e.g. from a file re-saved by an external editor) makes
+        // serde_json reject otherwise-valid JSON; falling back to Default in
+        // that case would silently discard every saved preference.
+        .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{FEFF}')).ok())
         .unwrap_or_default()
 }
 
@@ -223,7 +226,7 @@ fn show_instagram<R: Runtime>(app: &AppHandle<R>, destination: Option<&str>) {
 
 fn hide_main_window<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
     if let Some(settings) = app.get_webview_window("settings") {
-        let _ = settings.close();
+        let _ = settings.hide();
     }
     set_window_shown(app, false);
     leave_open_thread(app);
@@ -452,24 +455,41 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
 }
 
 fn create_settings_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
-    WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("settings.html".into()))
-        .title("InstaDesk Settings")
-        .inner_size(510.0, 520.0)
-        .min_inner_size(510.0, 520.0)
-        .resizable(false)
-        .maximizable(false)
-        .decorations(false)
-        .visible(false)
-        .background_color(Color(17, 17, 22, 255))
-        .center()
-        .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS)
-        .build()?;
+    let window =
+        WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("settings.html".into()))
+            .title("InstaDesk Settings")
+            .inner_size(510.0, 520.0)
+            .min_inner_size(510.0, 520.0)
+            .resizable(false)
+            .maximizable(false)
+            .decorations(false)
+            .visible(false)
+            .background_color(Color(17, 17, 22, 255))
+            .center()
+            .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS)
+            .build()?;
+    // Hide rather than destroy on close. Tearing down and rebuilding this
+    // window's WebView2 controller on every open/close cycle raced with the
+    // async teardown on Windows — reopening soon after closing could hang or
+    // take down the whole app. Creating it lazily on first open (rather than
+    // eagerly at startup, as before) already keeps the idle-memory cost at
+    // zero for the common case where settings is never opened.
+    let handle = app.clone();
+    window.on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            if let Some(window) = handle.get_webview_window("settings") {
+                let _ = window.hide();
+            }
+        }
+    });
     Ok(())
 }
 
 fn show_settings<R: Runtime>(app: &AppHandle<R>) {
-    // This dialog is infrequently used. Create it on demand and really close
-    // it when dismissed so its WebView2 document does not remain resident.
+    // Created on first use rather than eagerly at startup, so the window and
+    // its WebView2 document cost nothing for the common case where settings
+    // is never opened during a session.
     if app.get_webview_window("settings").is_none() {
         if let Err(error) = create_settings_window(app) {
             eprintln!("[InstaDesk] could not create settings window: {error}");
@@ -983,7 +1003,10 @@ fn window_action(app: AppHandle, webview: Webview, action: &str) -> Result<(), S
     let window = webview.window();
     match (webview.label(), action) {
         ("main", "drag") => window.start_dragging().map_err(|e| e.to_string())?,
-        ("main", "minimize") => window.minimize().map_err(|e| e.to_string())?,
+        ("main", "minimize") => {
+            set_window_shown(&app, false);
+            window.minimize().map_err(|e| e.to_string())?
+        }
         ("main", "maximize") => {
             #[cfg(windows)]
             {
@@ -1039,7 +1062,7 @@ fn window_action(app: AppHandle, webview: Webview, action: &str) -> Result<(), S
             .map_err(|e| e.to_string())?,
         ("main" | "instagram" | "settings", "toggle_window") => toggle_main_window(&app),
         ("settings", "drag_settings") => window.start_dragging().map_err(|e| e.to_string())?,
-        ("settings", "close_settings") => window.close().map_err(|e| e.to_string())?,
+        ("settings", "close_settings") => window.hide().map_err(|e| e.to_string())?,
         _ => return Err("Window action is not allowed for this WebView".into()),
     }
     Ok(())
