@@ -1,6 +1,6 @@
 [package]
 name = "instadesk"
-version = "0.2.1"
+version = "0.2.2"
 description = "An unofficial privacy-focused Instagram desktop wrapper"
 authors = ["InstaDesk contributors"]
 license = "MIT"
