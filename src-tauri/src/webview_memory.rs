@@ -22,11 +22,7 @@ const ALL: [&str; 3] = ["main", "inbox", "instagram"];
 
 pub fn release<R: Runtime>(app: &AppHandle<R>) {
     for label in ALL {
-        let Some(webview) = app.get_webview(label) else {
-            continue;
-        };
-        let suspend = label == SUSPENDABLE;
-        let _ = webview.with_webview(move |platform| platform_release(&platform, suspend));
+        apply(app, label, Mode::Release(label == SUSPENDABLE));
     }
     trim_working_sets(app);
     eprintln!("[InstaDesk] webviews trimmed for the background");
@@ -34,13 +30,40 @@ pub fn release<R: Runtime>(app: &AppHandle<R>) {
 
 pub fn restore<R: Runtime>(app: &AppHandle<R>) {
     for label in ALL {
-        let Some(webview) = app.get_webview(label) else {
-            continue;
-        };
-        let resume = label == SUSPENDABLE;
-        let _ = webview.with_webview(move |platform| platform_restore(&platform, resume));
+        apply(app, label, Mode::Restore(label == SUSPENDABLE));
     }
     eprintln!("[InstaDesk] webviews restored to the foreground");
+}
+
+/// Suspends one WebView the user cannot currently see. The settings window is
+/// kept alive between openings rather than rebuilt — tearing its WebView2
+/// controller down and putting it back raced with its own async teardown and
+/// could take the app with it — so suspending is how it stops costing anything
+/// while it sits hidden.
+pub fn suspend<R: Runtime>(app: &AppHandle<R>, label: &str) {
+    apply(app, label, Mode::Release(true));
+    trim_working_sets(app);
+}
+
+pub fn resume<R: Runtime>(app: &AppHandle<R>, label: &str) {
+    apply(app, label, Mode::Restore(true));
+}
+
+#[derive(Clone, Copy)]
+enum Mode {
+    /// Always lowers the memory target; the flag additionally suspends.
+    Release(bool),
+    Restore(bool),
+}
+
+fn apply<R: Runtime>(app: &AppHandle<R>, label: &str, mode: Mode) {
+    let Some(webview) = app.get_webview(label) else {
+        return;
+    };
+    let _ = webview.with_webview(move |platform| match mode {
+        Mode::Release(suspend) => platform_release(&platform, suspend),
+        Mode::Restore(resume) => platform_restore(&platform, resume),
+    });
 }
 
 #[cfg(windows)]

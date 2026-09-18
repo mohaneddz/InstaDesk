@@ -325,9 +325,7 @@ fn show_instagram<R: Runtime>(app: &AppHandle<R>, destination: Option<&str>) {
 }
 
 fn hide_main_window<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
-    if let Some(settings) = app.get_webview_window("settings") {
-        let _ = settings.hide();
-    }
+    hide_settings(app);
     set_window_shown(app, false);
     leave_open_thread(app);
     if minimize_to_tray(app) {
@@ -588,12 +586,18 @@ fn create_settings_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     window.on_window_event(move |event| {
         if let WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
-            if let Some(window) = handle.get_webview_window("settings") {
-                let _ = window.hide();
-            }
+            hide_settings(&handle);
         }
     });
     Ok(())
+}
+
+fn hide_settings<R: Runtime>(app: &AppHandle<R>) {
+    let Some(window) = app.get_webview_window("settings") else {
+        return;
+    };
+    let _ = window.hide();
+    webview_memory::suspend(app, "settings");
 }
 
 fn show_settings<R: Runtime>(app: &AppHandle<R>) {
@@ -619,6 +623,7 @@ fn show_settings<R: Runtime>(app: &AppHandle<R>) {
             }
         }
         if let Some(window) = handle.get_webview_window("settings") {
+            webview_memory::resume(&handle, "settings");
             let _ = window.show();
             let _ = window.unminimize();
             let _ = window.set_focus();
@@ -1211,9 +1216,7 @@ fn run_window_action(app: &AppHandle, webview: &Webview, label: &str, action: &s
             let _ = webview.eval("history.forward()");
         }
         (_, "toggle_window") => toggle_main_window(app),
-        ("settings", "close_settings") => {
-            let _ = window.hide();
-        }
+        ("settings", "close_settings") => hide_settings(app),
         _ => {}
     }
 }
