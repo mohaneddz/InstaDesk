@@ -25,18 +25,45 @@ const TITLEBAR_HEIGHT: f64 = 38.0;
 /// How long the window has to stay out of sight before its WebViews are
 /// suspended and trimmed.
 const BACKGROUND_TRIM_DELAY: std::time::Duration = std::time::Duration::from_secs(4);
-/// Without this, WebView2 applies Chromium's normal background-tab throttling
-/// once the host window has been hidden for a while, which starves the inbox
-/// webview's polling timers and silently stops new-message detection. The
-/// `--disable-features=...` prefix has to be repeated here because setting
-/// additional browser args replaces wry's own default rather than appending.
+/// Browser arguments shared by every WebView.
 ///
-/// Must be applied to every webview that shares the default data directory
-/// (main, instagram, inbox, settings): WebView2 fails to create a webview
-/// whose environment options differ from another already running against
-/// the same data directory, which otherwise shows up as a blank white
-/// webview and an app that stops responding.
-const KEEP_RUNNING_IN_BACKGROUND_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding";
+/// They have to be identical everywhere: WebView2 refuses to create a WebView
+/// whose environment options differ from one already running against the same
+/// data directory, which shows up as a blank white WebView and an app that
+/// stops responding.
+///
+/// The throttling switches keep the inbox WebView alive. Chromium otherwise
+/// applies its normal background-tab treatment once the host window has been
+/// hidden for a while, starving the monitor's timers so new-message detection
+/// silently stops, and treats the inbox WebView as occluded — it sits behind
+/// the Instagram one by design — so it stops painting the virtualised
+/// conversation list the monitor reads. The `--disable-features=` prefix is
+/// repeated in full because setting additional arguments replaces wry's own
+/// default rather than appending to it.
+///
+/// The rest is about footprint. `--process-per-site` is the big one: both
+/// Instagram WebViews are the same site, so they share a single renderer
+/// process instead of each paying for their own. The V8 heap cap keeps a long
+/// session from growing without bound — Instagram sits well inside it, and V8
+/// collects harder rather than failing when it gets close. The remaining
+/// switches turn off background services a wrapper around one site has no use
+/// for.
+const KEEP_RUNNING_IN_BACKGROUND_ARGS: &str = concat!(
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion,",
+    "Translate,MediaRouter,DialMediaRouteProvider,OptimizationHints,",
+    "OptimizationGuideModelDownloading,AutofillServerCommunication",
+    " --disable-background-timer-throttling",
+    " --disable-backgrounding-occluded-windows",
+    " --disable-renderer-backgrounding",
+    " --process-per-site",
+    " --renderer-process-limit=3",
+    " --js-flags=--max-old-space-size=384",
+    " --disable-background-networking",
+    " --disable-component-update",
+    " --disable-breakpad",
+    " --disable-sync",
+    " --no-pings",
+);
 
 
 /// Runs `task` off the main thread.
