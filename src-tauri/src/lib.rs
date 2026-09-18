@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     collections::{HashSet, VecDeque},
     fs,
@@ -15,11 +15,16 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
+mod webview_memory;
+
 const INSTAGRAM_HOME: &str = "https://www.instagram.com/";
 const INSTAGRAM_INBOX: &str = "https://www.instagram.com/direct/inbox/";
 const SETTINGS_FILE: &str = "settings.json";
 const MAX_DEDUP: usize = 1000;
 const TITLEBAR_HEIGHT: f64 = 38.0;
+/// How long the window has to stay out of sight before its WebViews are
+/// suspended and trimmed.
+const BACKGROUND_TRIM_DELAY: std::time::Duration = std::time::Duration::from_secs(4);
 /// Without this, WebView2 applies Chromium's normal background-tab throttling
 /// once the host window has been hidden for a while, which starves the inbox
 /// webview's polling timers and silently stops new-message detection. The
@@ -33,6 +38,21 @@ const TITLEBAR_HEIGHT: f64 = 38.0;
 /// webview and an app that stops responding.
 const KEEP_RUNNING_IN_BACKGROUND_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding";
 
+
+/// Runs `task` off the main thread.
+///
+/// Every command and menu callback arrives on the main thread, and a command
+/// arrives *inside* the WebView2 IPC callback that delivered it. Creating a
+/// window or driving another WebView2 controller from there makes wry pump a
+/// nested message loop inside that callback, which WebView2 does not allow
+/// re-entering: the main thread never comes back, so the custom titlebar
+/// stops answering drags and clicks while Instagram — painted by a separate
+/// browser process — keeps responding, and the app ends up "not responding".
+/// Hopping to a worker first means the work is posted to the event loop and
+/// picked up on its next iteration, outside that callback.
+fn defer<F: FnOnce() + Send + 'static>(task: F) {
+    tauri::async_runtime::spawn_blocking(task);
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -164,6 +184,15 @@ struct AppState {
     /// tray and made "don't notify while open" suppress notifications even when
     /// the app was closed.
     window_shown: AtomicBool,
+    /// Set while a settings-window build is in flight so two rapid clicks do
+    /// not race to create two windows under the same label.
+    settings_opening: AtomicBool,
+    /// Whether the WebViews are currently trimmed for the background.
+    backgrounded: AtomicBool,
+    /// Bumped on every show and hide. A scheduled trim only runs while it
+    /// still matches, so alt-tabbing through the app does not thrash
+    /// WebView2 suspend and resume.
+    background_generation: AtomicU64,
 }
 
 fn set_window_shown<R: Runtime>(app: &AppHandle<R>, shown: bool) {
@@ -211,10 +240,54 @@ fn navigate<R: Runtime>(webview: &Webview<R>, raw: &str) {
     }
 }
 
+fn minimize_to_tray<R: Runtime>(app: &AppHandle<R>) -> bool {
+    app.state::<AppState>()
+        .settings
+        .lock()
+        .map(|settings| settings.minimize_to_tray)
+        .unwrap_or(true)
+}
+
+/// Hand the WebViews' memory back once the window has stayed out of sight for
+/// a moment. The delay exists because alt-tabbing or a quick peek at another
+/// app would otherwise pay for a full suspend/resume round trip every time.
+fn enter_background<R: Runtime>(app: &AppHandle<R>) {
+    let generation = app
+        .state::<AppState>()
+        .background_generation
+        .fetch_add(1, Ordering::SeqCst)
+        + 1;
+    let handle = app.clone();
+    // A plain thread rather than `defer`: this one sleeps, and parking a
+    // pooled blocking worker for seconds at a time is what the pool is for
+    // avoiding.
+    std::thread::spawn(move || {
+        std::thread::sleep(BACKGROUND_TRIM_DELAY);
+        let state = handle.state::<AppState>();
+        if state.background_generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        if state.backgrounded.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        webview_memory::release(&handle);
+    });
+}
+
+fn leave_background<R: Runtime>(app: &AppHandle<R>) {
+    let state = app.state::<AppState>();
+    state.background_generation.fetch_add(1, Ordering::SeqCst);
+    if state.backgrounded.swap(false, Ordering::SeqCst) {
+        webview_memory::restore(app);
+    }
+}
+
 fn show_instagram<R: Runtime>(app: &AppHandle<R>, destination: Option<&str>) {
     let Some(window) = app.get_window("main") else {
         return;
     };
+    // Before any navigation: a suspended WebView2 ignores it.
+    leave_background(app);
     if let (Some(url), Some(webview)) = (destination, app.get_webview("instagram")) {
         navigate(&webview, url);
     }
@@ -230,17 +303,12 @@ fn hide_main_window<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
     }
     set_window_shown(app, false);
     leave_open_thread(app);
-    let minimize_to_tray = app
-        .state::<AppState>()
-        .settings
-        .lock()
-        .map(|settings| settings.minimize_to_tray)
-        .unwrap_or(true);
-    if minimize_to_tray {
+    if minimize_to_tray(app) {
         let _ = window.hide();
     } else {
         let _ = window.minimize();
     }
+    enter_background(app);
 }
 
 /// A thread left open behind a hidden window keeps receiving live messages
@@ -426,7 +494,21 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
     )?;
     let handle = app.clone();
     window.on_window_event(move |event| match event {
-        WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+        WindowEvent::Resized(size) => {
+            // A minimize from the taskbar or Win+D never reaches a command, so
+            // the zero-sized Resized that Windows sends is the only reliable
+            // signal for it — and the first non-zero one, the only signal that
+            // the window is back.
+            if size.width == 0 || size.height == 0 {
+                enter_background(&handle);
+                return;
+            }
+            leave_background(&handle);
+            if let Some(window) = handle.get_window("main") {
+                layout_main_window(&window);
+            }
+        }
+        WindowEvent::ScaleFactorChanged { .. } => {
             if let Some(window) = handle.get_window("main") {
                 layout_main_window(&window);
             }
@@ -447,6 +529,7 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
                 if let Some(window) = handle.get_window("main") {
                     let _ = window.hide();
                 }
+                enter_background(&handle);
             }
         }
         _ => {}
@@ -489,22 +572,36 @@ fn create_settings_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 fn show_settings<R: Runtime>(app: &AppHandle<R>) {
     // Created on first use rather than eagerly at startup, so the window and
     // its WebView2 document cost nothing for the common case where settings
-    // is never opened during a session.
-    if app.get_webview_window("settings").is_none() {
-        if let Err(error) = create_settings_window(app) {
-            eprintln!("[InstaDesk] could not create settings window: {error}");
-            return;
-        }
-    }
-    let Some(window) = app.get_webview_window("settings") else {
-        eprintln!("[InstaDesk] settings window is unavailable");
+    // is never opened during a session. Two clicks in quick succession would
+    // otherwise both find no window and race to build one under the same
+    // label, so the first one through the gate owns the creation.
+    let state = app.state::<AppState>();
+    if state.settings_opening.swap(true, Ordering::SeqCst) {
         return;
-    };
-    let _ = window.show();
-    let _ = window.unminimize();
-    let _ = window.set_focus();
+    }
+    let handle = app.clone();
+    defer(move || {
+        if handle.get_webview_window("settings").is_none() {
+            if let Err(error) = create_settings_window(&handle) {
+                eprintln!("[InstaDesk] could not create settings window: {error}");
+                handle
+                    .state::<AppState>()
+                    .settings_opening
+                    .store(false, Ordering::SeqCst);
+                return;
+            }
+        }
+        if let Some(window) = handle.get_webview_window("settings") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+        handle
+            .state::<AppState>()
+            .settings_opening
+            .store(false, Ordering::SeqCst);
+    });
 }
-
 fn is_new_message(state: &AppState, key: String) -> bool {
     let Ok(mut guard) = state.dedup.lock() else {
         return false;
@@ -999,13 +1096,38 @@ async fn copy_image(webview: Webview, url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn window_action(app: AppHandle, webview: Webview, action: &str) -> Result<(), String> {
+fn window_action(app: AppHandle, webview: Webview, action: String) -> Result<(), String> {
+    let label = webview.label().to_string();
+    // Dragging has to begin synchronously, while the pointer button that
+    // triggered it is still held, so it stays on the calling thread. All it
+    // does is post a message to the window, so it never re-enters WebView2.
+    if matches!(
+        (label.as_str(), action.as_str()),
+        ("main", "drag") | ("settings", "drag_settings")
+    ) {
+        return webview.window().start_dragging().map_err(|e| e.to_string());
+    }
+    // Everything else touches windows or other WebView2 controllers, so it is
+    // validated here and carried out off the IPC callback — see `defer`.
+    match (label.as_str(), action.as_str()) {
+        ("main", "minimize" | "maximize" | "close" | "settings")
+        | ("main" | "instagram", "fullscreen")
+        | ("instagram", "back" | "forward")
+        | ("settings", "close_settings")
+        | ("main" | "instagram" | "settings", "toggle_window") => {}
+        _ => return Err("Window action is not allowed for this WebView".into()),
+    }
+    defer(move || run_window_action(&app, &webview, &label, &action));
+    Ok(())
+}
+
+fn run_window_action(app: &AppHandle, webview: &Webview, label: &str, action: &str) {
     let window = webview.window();
-    match (webview.label(), action) {
-        ("main", "drag") => window.start_dragging().map_err(|e| e.to_string())?,
+    match (label, action) {
         ("main", "minimize") => {
-            set_window_shown(&app, false);
-            window.minimize().map_err(|e| e.to_string())?
+            set_window_shown(app, false);
+            enter_background(app);
+            let _ = window.minimize();
         }
         ("main", "maximize") => {
             #[cfg(windows)]
@@ -1013,59 +1135,52 @@ fn window_action(app: AppHandle, webview: Webview, action: &str) -> Result<(), S
                 use windows::Win32::UI::WindowsAndMessaging::{
                     IsZoomed, ShowWindow, SW_MAXIMIZE, SW_RESTORE,
                 };
-                let hwnd = window.hwnd().map_err(|error| error.to_string())?;
-                unsafe {
-                    let _ = ShowWindow(
-                        hwnd,
-                        if IsZoomed(hwnd).as_bool() {
-                            SW_RESTORE
-                        } else {
-                            SW_MAXIMIZE
-                        },
-                    );
+                if let Ok(hwnd) = window.hwnd() {
+                    unsafe {
+                        let _ = ShowWindow(
+                            hwnd,
+                            if IsZoomed(hwnd).as_bool() {
+                                SW_RESTORE
+                            } else {
+                                SW_MAXIMIZE
+                            },
+                        );
+                    }
                 }
             }
             #[cfg(not(windows))]
-            if window.is_maximized().map_err(|e| e.to_string())? {
-                window.unmaximize()
-            } else {
-                window.maximize()
+            {
+                let _ = if window.is_maximized().unwrap_or(false) {
+                    window.unmaximize()
+                } else {
+                    window.maximize()
+                };
             }
-            .map_err(|e| e.to_string())?;
         }
-        ("main" | "instagram", "fullscreen") => {
-            let fullscreen = window.is_fullscreen().map_err(|e| e.to_string())?;
-            window
-                .set_fullscreen(!fullscreen)
-                .map_err(|e| e.to_string())?;
+        (_, "fullscreen") => {
+            let fullscreen = window.is_fullscreen().unwrap_or(false);
+            let _ = window.set_fullscreen(!fullscreen);
         }
         ("main", "close") => {
-            let minimize = app
-                .state::<AppState>()
-                .settings
-                .lock()
-                .map(|s| s.minimize_to_tray)
-                .unwrap_or(true);
-            if minimize {
-                set_window_shown(&app, false);
-                leave_open_thread(&app);
-                window.hide()
+            if minimize_to_tray(app) {
+                hide_main_window(app, &window);
             } else {
-                window.close()
+                let _ = window.close();
             }
-            .map_err(|e| e.to_string())?;
         }
-        ("main", "settings") => show_settings(&app),
-        ("instagram", "back") => webview.eval("history.back()").map_err(|e| e.to_string())?,
-        ("instagram", "forward") => webview
-            .eval("history.forward()")
-            .map_err(|e| e.to_string())?,
-        ("main" | "instagram" | "settings", "toggle_window") => toggle_main_window(&app),
-        ("settings", "drag_settings") => window.start_dragging().map_err(|e| e.to_string())?,
-        ("settings", "close_settings") => window.hide().map_err(|e| e.to_string())?,
-        _ => return Err("Window action is not allowed for this WebView".into()),
+        ("main", "settings") => show_settings(app),
+        ("instagram", "back") => {
+            let _ = webview.eval("history.back()");
+        }
+        ("instagram", "forward") => {
+            let _ = webview.eval("history.forward()");
+        }
+        (_, "toggle_window") => toggle_main_window(app),
+        ("settings", "close_settings") => {
+            let _ = window.hide();
+        }
+        _ => {}
     }
-    Ok(())
 }
 
 #[tauri::command]
@@ -1313,6 +1428,9 @@ pub fn run() {
                 tray_menu: Mutex::new(None),
                 quitting: AtomicBool::new(false),
                 window_shown: AtomicBool::new(!launched_hidden),
+                settings_opening: AtomicBool::new(false),
+                backgrounded: AtomicBool::new(false),
+                background_generation: AtomicU64::new(0),
             });
             build_tray(app.handle(), &settings)?;
             let window = create_main_window(app.handle())?;
@@ -1378,6 +1496,9 @@ mod tests {
             tray_menu: Mutex::new(None),
             quitting: AtomicBool::new(false),
             window_shown: AtomicBool::new(true),
+            settings_opening: AtomicBool::new(false),
+            backgrounded: AtomicBool::new(false),
+            background_generation: AtomicU64::new(0),
         };
         assert!(is_new_message(&state, "thread:message".into()));
         assert!(!is_new_message(&state, "thread:message".into()));
