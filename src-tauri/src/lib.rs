@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{HashSet, VecDeque},
     fs,
@@ -23,8 +23,9 @@ const SETTINGS_FILE: &str = "settings.json";
 const MAX_DEDUP: usize = 1000;
 const TITLEBAR_HEIGHT: f64 = 38.0;
 /// How long the window has to stay out of sight before its WebViews are
-/// suspended and trimmed.
+/// suspended and trimmed, and how often that is checked.
 const BACKGROUND_TRIM_DELAY: std::time::Duration = std::time::Duration::from_secs(4);
+const BACKGROUND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 /// Browser arguments shared by every WebView.
 ///
 /// They have to be identical everywhere: WebView2 refuses to create a WebView
@@ -216,10 +217,6 @@ struct AppState {
     settings_opening: AtomicBool,
     /// Whether the WebViews are currently trimmed for the background.
     backgrounded: AtomicBool,
-    /// Bumped on every show and hide. A scheduled trim only runs while it
-    /// still matches, so alt-tabbing through the app does not thrash
-    /// WebView2 suspend and resume.
-    background_generation: AtomicU64,
 }
 
 fn set_window_shown<R: Runtime>(app: &AppHandle<R>, shown: bool) {
@@ -275,36 +272,68 @@ fn minimize_to_tray<R: Runtime>(app: &AppHandle<R>) -> bool {
         .unwrap_or(true)
 }
 
-/// Hand the WebViews' memory back once the window has stayed out of sight for
-/// a moment. The delay exists because alt-tabbing or a quick peek at another
-/// app would otherwise pay for a full suspend/resume round trip every time.
-fn enter_background<R: Runtime>(app: &AppHandle<R>) {
-    let generation = app
-        .state::<AppState>()
-        .background_generation
-        .fetch_add(1, Ordering::SeqCst)
-        + 1;
-    let handle = app.clone();
-    // A plain thread rather than `defer`: this one sleeps, and parking a
-    // pooled blocking worker for seconds at a time is what the pool is for
-    // avoiding.
+/// Watches whether the window is on screen, and hands the WebViews' memory
+/// back once it has been out of sight for a moment.
+///
+/// Polling rather than reacting to a window event because there is no event to
+/// react to: minimizing produces no `Resized`, and nothing at all reaches the
+/// app when the user minimizes from the taskbar or hits Win+D. `IsIconic` and
+/// `IsWindowVisible` cover every one of those routes for the price of one
+/// cheap call a few times a second. The delay before acting is there so that
+/// alt-tabbing past the app does not pay for a suspend and resume each time.
+#[cfg(windows)]
+fn watch_window_visibility<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow, IsWindowVisible};
+
+    let Ok(handle) = window.hwnd() else {
+        return;
+    };
+    let hwnd = handle.0 as isize;
+    let app = app.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(BACKGROUND_TRIM_DELAY);
-        let state = handle.state::<AppState>();
-        if state.background_generation.load(Ordering::SeqCst) != generation {
-            return;
+        let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+        let mut hidden_for = std::time::Duration::ZERO;
+        loop {
+            std::thread::sleep(BACKGROUND_POLL_INTERVAL);
+            let (alive, hidden) = unsafe {
+                (
+                    IsWindow(Some(hwnd)).as_bool(),
+                    !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool(),
+                )
+            };
+            if !alive {
+                return;
+            }
+            let state = app.state::<AppState>();
+            if !hidden {
+                hidden_for = std::time::Duration::ZERO;
+                if state.backgrounded.swap(false, Ordering::SeqCst) {
+                    webview_memory::restore(&app);
+                }
+                continue;
+            }
+            if state.backgrounded.load(Ordering::SeqCst) {
+                continue;
+            }
+            hidden_for += BACKGROUND_POLL_INTERVAL;
+            if hidden_for >= BACKGROUND_TRIM_DELAY {
+                state.backgrounded.store(true, Ordering::SeqCst);
+                webview_memory::release(&app);
+            }
         }
-        if state.backgrounded.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        webview_memory::release(&handle);
     });
 }
 
+#[cfg(not(windows))]
+fn watch_window_visibility<R: Runtime>(_app: &AppHandle<R>, _window: &Window<R>) {}
+
 fn leave_background<R: Runtime>(app: &AppHandle<R>) {
-    let state = app.state::<AppState>();
-    state.background_generation.fetch_add(1, Ordering::SeqCst);
-    if state.backgrounded.swap(false, Ordering::SeqCst) {
+    if app
+        .state::<AppState>()
+        .backgrounded
+        .swap(false, Ordering::SeqCst)
+    {
         webview_memory::restore(app);
     }
 }
@@ -333,7 +362,6 @@ fn hide_main_window<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
     } else {
         let _ = window.minimize();
     }
-    enter_background(app);
 }
 
 /// A thread left open behind a hidden window keeps receiving live messages
@@ -519,25 +547,14 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
     )?;
     let handle = app.clone();
     window.on_window_event(move |event| match event {
-        WindowEvent::Resized(size) => {
-            // A minimize from the taskbar or Win+D never reaches a command, so
-            // the zero-sized Resized that Windows sends is the only reliable
-            // signal for it — and the first non-zero one, the only signal that
-            // the window is back.
-            if size.width == 0 || size.height == 0 {
-                enter_background(&handle);
-                return;
-            }
-            leave_background(&handle);
+        WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
             if let Some(window) = handle.get_window("main") {
                 layout_main_window(&window);
             }
         }
-        WindowEvent::ScaleFactorChanged { .. } => {
-            if let Some(window) = handle.get_window("main") {
-                layout_main_window(&window);
-            }
-        }
+        // Restoring from the taskbar reaches no command of ours; this is the
+        // quickest signal that the window is back, ahead of the watcher.
+        WindowEvent::Focused(true) => leave_background(&handle),
         WindowEvent::CloseRequested { api, .. } => {
             let state = handle.state::<AppState>();
             // Lock-free read; quitting is set with SeqCst store on quit.
@@ -554,7 +571,6 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
                 if let Some(window) = handle.get_window("main") {
                     let _ = window.hide();
                 }
-                enter_background(&handle);
             }
         }
         _ => {}
@@ -1166,7 +1182,6 @@ fn run_window_action(app: &AppHandle, webview: &Webview, label: &str, action: &s
     match (label, action) {
         ("main", "minimize") => {
             set_window_shown(app, false);
-            enter_background(app);
             let _ = window.minimize();
         }
         ("main", "maximize") => {
@@ -1468,10 +1483,10 @@ pub fn run() {
                 window_shown: AtomicBool::new(!launched_hidden),
                 settings_opening: AtomicBool::new(false),
                 backgrounded: AtomicBool::new(false),
-                background_generation: AtomicU64::new(0),
             });
             build_tray(app.handle(), &settings)?;
             let window = create_main_window(app.handle())?;
+            watch_window_visibility(app.handle(), &window);
             #[cfg(windows)]
             {
                 unsafe {
@@ -1536,7 +1551,6 @@ mod tests {
             window_shown: AtomicBool::new(true),
             settings_opening: AtomicBool::new(false),
             backgrounded: AtomicBool::new(false),
-            background_generation: AtomicU64::new(0),
         };
         assert!(is_new_message(&state, "thread:message".into()));
         assert!(!is_new_message(&state, "thread:message".into()));
