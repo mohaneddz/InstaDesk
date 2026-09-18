@@ -1022,13 +1022,27 @@ async fn download_media(
                 .and_then(|value| value.to_str().ok()),
             kind,
         );
-        let mut buffer: Vec<u8> = Vec::with_capacity(total as usize);
+        let name = if count > 1 {
+            format!("{safe_base}-{}", index + 1)
+        } else {
+            safe_base.clone()
+        };
+        let path = unique_download_path(&dir, &name, &ext);
+        // Written chunk by chunk rather than collected first: a reel held whole
+        // in memory before being saved is tens of megabytes of resident memory
+        // the app never gets a chance to hand back.
+        let mut file = std::io::BufWriter::new(
+            fs::File::create(&path).map_err(|error| format!("Could not save media: {error}"))?,
+        );
+        let mut written = 0u64;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| format!("Download interrupted: {error}"))?;
-            buffer.extend_from_slice(&chunk);
+            std::io::Write::write_all(&mut file, &chunk)
+                .map_err(|error| format!("Could not save media: {error}"))?;
+            written += chunk.len() as u64;
             let item_fraction = if total > 0 {
-                (buffer.len() as f64 / total as f64).min(1.0)
+                (written as f64 / total as f64).min(1.0)
             } else {
                 0.0
             };
@@ -1039,13 +1053,7 @@ async fn download_media(
                 overall_percent: overall,
             });
         }
-        let name = if count > 1 {
-            format!("{safe_base}-{}", index + 1)
-        } else {
-            safe_base.clone()
-        };
-        let path = unique_download_path(&dir, &name, &ext);
-        fs::write(&path, &buffer).map_err(|error| format!("Could not save media: {error}"))?;
+        std::io::Write::flush(&mut file).map_err(|error| format!("Could not save media: {error}"))?;
         saved += 1;
         let _ = on_progress.send(DownloadProgress {
             index,
