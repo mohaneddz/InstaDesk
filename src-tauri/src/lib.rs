@@ -9,6 +9,7 @@ use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     utils::config::Color,
+    webview::NewWindowResponse,
     AppHandle, Manager, PhysicalPosition, PhysicalSize, Runtime, Webview, WebviewBuilder,
     WebviewUrl, WebviewWindowBuilder, Window, WindowBuilder, WindowEvent,
 };
@@ -254,8 +255,66 @@ fn save_settings<R: Runtime>(app: &AppHandle<R>, settings: &Settings) {
 fn instagram_url(raw: &str) -> Option<url::Url> {
     let url = url::Url::parse(raw).ok()?;
     let host = url.host_str()?;
+    // l.instagram.com is the link shim every outbound link is wrapped in. It is
+    // an instagram.com host but it is on its way somewhere else, so it belongs
+    // in the browser: opening the shim there lets the browser follow the
+    // redirect, instead of stranding the app on the interstitial.
+    if host == "l.instagram.com" {
+        return None;
+    }
     (url.scheme() == "https" && (host == "instagram.com" || host.ends_with(".instagram.com")))
         .then_some(url)
+}
+
+/// Hands a link that is not part of Instagram to whatever the user browses
+/// with. Everything outside instagram.com is refused inside the app — an
+/// advertiser's site or a link a friend sent has no business rendering in a
+/// WebView that holds the session cookie — so without this those links simply
+/// did nothing when clicked.
+fn open_externally(url: &url::Url) {
+    if !matches!(url.scheme(), "http" | "https") {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use windows::core::{h, HSTRING};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let target = HSTRING::from(url.as_str());
+        // ShellExecuteW on a URL hands it to the default browser; the return
+        // value is a legacy HINSTANCE we have no use for.
+        unsafe {
+            ShellExecuteW(None, h!("open"), &target, None, None, SW_SHOWNORMAL);
+        }
+    }
+}
+
+/// Decides what a WebView may load: Instagram itself stays in the app, anything
+/// else is opened in the default browser instead.
+fn allow_navigation(raw: &str) -> bool {
+    if instagram_url(raw).is_some() {
+        return true;
+    }
+    if let Ok(url) = url::Url::parse(raw) {
+        open_externally(&url);
+    }
+    false
+}
+
+/// Handles the links Instagram opens with `target="_blank"`, which never reach
+/// the navigation handler. The app is a single window by design, so an
+/// Instagram link is followed in place in the WebView that asked for it and
+/// anything else goes to the browser; either way no second window is created.
+fn handle_new_window<R: Runtime>(app: &AppHandle<R>, url: &url::Url) -> NewWindowResponse<R> {
+    if instagram_url(url.as_str()).is_some() {
+        if let Some(webview) = app.get_webview("instagram") {
+            let _ = webview.navigate(url.clone());
+        }
+    } else {
+        open_externally(url);
+    }
+    NewWindowResponse::Deny
 }
 
 fn navigate<R: Runtime>(webview: &Webview<R>, raw: &str) {
@@ -533,15 +592,17 @@ fn create_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Window<R>
         WebviewBuilder::new("inbox", WebviewUrl::External(inbox_url))
             .initialization_script(inbox_init)
             .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS)
-            .on_navigation(|url| instagram_url(url.as_str()).is_some()),
+            .on_navigation(|url| allow_navigation(url.as_str())),
         PhysicalPosition::new(0, chrome_height as i32),
         PhysicalSize::new(size.width, content_height),
     )?;
+    let new_window_handle = app.clone();
     window.add_child(
         WebviewBuilder::new("instagram", WebviewUrl::External(url))
             .initialization_script(instagram_init)
             .additional_browser_args(KEEP_RUNNING_IN_BACKGROUND_ARGS)
-            .on_navigation(|url| instagram_url(url.as_str()).is_some()),
+            .on_navigation(|url| allow_navigation(url.as_str()))
+            .on_new_window(move |url, _| handle_new_window(&new_window_handle, &url)),
         PhysicalPosition::new(0, chrome_height as i32),
         PhysicalSize::new(size.width, content_height),
     )?;
@@ -1539,6 +1600,11 @@ mod tests {
         assert!(instagram_url("http://www.instagram.com/direct/t/123/").is_none());
         assert!(instagram_url("https://instagram.example/direct/t/123/").is_none());
         assert!(instagram_url("javascript:alert(1)").is_none());
+    }
+
+    #[test]
+    fn outbound_link_shim_is_not_treated_as_instagram() {
+        assert!(instagram_url("https://l.instagram.com/?u=https%3A%2F%2Fexample.com").is_none());
     }
 
     #[test]
